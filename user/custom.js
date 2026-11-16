@@ -401,6 +401,67 @@
     return best.items;
   }
 
+  /*
+   * Mid-turn narration is frequently NOT rendered as markdown: Antigravity stores the text that accompanies tool
+   * calls in the planner step's `thinking` field and shows it inside the (often collapsed) tool group, so no
+   * <ul class="contains-task-list"> ever exists for it. Read checklists straight from the step data instead.
+   */
+  const TASK_LINE_RE = /^\s*(?:[-*+]|\d+[.)])\s+\[([ xX/])\]\s+(.+?)\s*$/;
+  const stepTextSeen = new WeakMap();
+  function renderInlineMd(text) {
+    return escapeHtml(text)
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  }
+  function extractTaskLists(md) {
+    const lists = [];
+    let cur = null;
+    const flush = () => {
+      if (cur && cur.length >= 2 && cur.length <= 15) lists.push(cur);
+      cur = null;
+    };
+    for (const line of String(md || '').split('\n')) {
+      const m = line.match(TASK_LINE_RE);
+      if (m) {
+        if (!cur) cur = [];
+        const mark = m[1];
+        cur.push({
+          status: mark === '/' ? 'in_progress' : mark === ' ' ? 'pending' : 'completed',
+          html: renderInlineMd(m[2])
+        });
+      } else if (line.trim() || cur === null) {
+        flush();
+      }
+    }
+    flush();
+    return lists;
+  }
+  function harvestStepChecklists(turnEl) {
+    if (!turnEl) return;
+    for (const btn of turnEl.querySelectorAll('button[data-testid="tool-group-collapsible"]')) {
+      const fk = Object.keys(btn).find((k) => k.startsWith('__reactFiber$'));
+      let f = fk ? btn[fk] : null;
+      let steps = null;
+      for (let i = 0; i < 6 && f; i++, f = f.return) {
+        const p = f.memoizedProps;
+        if (p && Array.isArray(p.steps)) {
+          steps = p.steps;
+          break;
+        }
+      }
+      if (!steps) continue;
+      for (const s of steps) {
+        const v = s && s.step && s.step.case === 'plannerResponse' ? s.step.value : null;
+        if (!v || typeof v !== 'object') continue;
+        const text = `${v.modifiedResponse || v.response || ''}\n${v.thinking || ''}`;
+        if (stepTextSeen.get(v) === text.length) continue;
+        stepTextSeen.set(v, text.length);
+        if (text.indexOf('[') === -1) continue;
+        for (const items of extractTaskLists(text)) rememberTurnTodo(turnEl, items);
+      }
+    }
+  }
+
   /**
    * Only *execution-progress* checklists are taken over:
    *  - a cluster starts with a list containing an active `[/]` item (the marker the AGENTS.md rule mandates);
@@ -462,6 +523,7 @@
         if (pane) {
           const paneTurns = pane.root.querySelectorAll('[data-testid="agent-response"]');
           latestPaneTurn = paneTurns.length ? paneTurns[paneTurns.length - 1] : null;
+          harvestStepChecklists(latestPaneTurn);
         }
 
         for (let i = 0; i < clusters.length; i++) {

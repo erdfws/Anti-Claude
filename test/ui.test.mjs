@@ -245,3 +245,27 @@ test('virtualised step stream: card keeps the newest progress after the mid-turn
   h.cleanups.forEach((fn) => fn());
   h.close();
 });
+
+test('mid-turn checklist stored only in step data (thinking field, never rendered) still advances the card', { skip }, async () => {
+  const h = mount(pane([ul(li('切换守护', 'in_progress'), li('真机验证'), li('收尾说明'))], { generating: true }));
+  const statuses = () => Array.from(h.doc.querySelectorAll('[data-ag-todo-dock] .ag-claude-todo-row')).map((r) => r.getAttribute('data-status'));
+  assert.deepEqual(statuses(), ['in_progress', 'pending', 'pending']);
+
+  const turn = h.doc.querySelector('[data-testid="agent-response"]');
+  const btn = h.doc.createElement('button');
+  btn.setAttribute('data-testid', 'tool-group-collapsible');
+  btn.setAttribute('aria-expanded', 'false');
+  btn.textContent = '已运行 命令';
+  const steps = [
+    { step: { case: 'generic', value: {} } },
+    { step: { case: 'plannerResponse', value: { response: '', thinking: '守护已切换。\n\n- [x] 切换守护\n- [/] 真机验证\n- [ ] 收尾说明\n\n接着验证。' } } }
+  ];
+  btn.__reactFiber$t = { memoizedProps: {}, return: { memoizedProps: {}, return: { memoizedProps: { steps, isRunning: true } } } };
+  turn.appendChild(btn);
+  await h.microtasks();
+  await new Promise((r) => setTimeout(r, 100));
+  h.flushFrames();
+  assert.deepEqual(statuses(), ['completed', 'in_progress', 'pending']);
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});

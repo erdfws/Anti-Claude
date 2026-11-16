@@ -309,3 +309,58 @@ test('marker with a mismatched total is ignored', { skip }, async () => {
   h.cleanups.forEach((fn) => fn());
   h.close();
 });
+
+test('inline backtick or fenced code examples never pollute progress; fresher fiber.alternate wins', { skip }, async () => {
+  const h = mount(pane([ul(li('阶段一', 'in_progress'), li('阶段二'), li('阶段三'))], { generating: true }));
+  const turn = h.doc.querySelector('[data-testid="agent-response"]');
+  const staleSteps = [{ step: { case: 'plannerResponse', value: { response: '开场说明' } } }];
+  const freshSteps = [
+    { step: { case: 'plannerResponse', value: { response: '开场说明' } } },
+    {
+      step: {
+        case: 'plannerResponse',
+        value: {
+          response: '正文引用示例 `<!-- todo:3/3 -->` 和 `〔进度 3/3〕` 不应生效，只有真实注释生效。<!-- todo:2/3 -->'
+        }
+      }
+    }
+  ];
+  /* Simulate React 18 double-buffering where __reactFiber$ points to the stale branch and fresher steps sit on .alternate */
+  turn.__reactFiber$t = {
+    memoizedProps: {},
+    return: {
+      memoizedProps: { container: { steps: staleSteps } },
+      alternate: { memoizedProps: { container: { steps: freshSteps } } }
+    }
+  };
+  turn.appendChild(h.doc.createElement('div'));
+  await settle(h);
+  assert.deepEqual(dockStatuses(h), ['completed', 'in_progress', 'pending']);
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});
+
+test('follow-up live turn relays incomplete checklist and advances via <!-- todo:N/M --> without re-emitting <ul>', { skip }, async () => {
+  const h = mount(
+    pane([ul(li('阶段一', 'in_progress'), li('阶段二'), li('阶段三')), '<p>继续执行第二阶段</p>'], { generating: true })
+  );
+  const turns = h.doc.querySelectorAll('[data-testid="agent-response"]');
+  const secondTurn = turns[1];
+  secondTurn.__reactFiber$t = {
+    memoizedProps: {},
+    return: {
+      memoizedProps: {
+        container: {
+          steps: [{ step: { case: 'plannerResponse', value: { response: '继续第二阶段。<!-- todo:2/3 -->' } } }]
+        }
+      }
+    }
+  };
+  secondTurn.appendChild(h.doc.createElement('div'));
+  await settle(h);
+  const dock = h.doc.querySelector('[data-ag-todo-dock]');
+  assert.equal(dock.parentElement, secondTurn, 'live card relays into the follow-up turn');
+  assert.deepEqual(dockStatuses(h), ['completed', 'in_progress', 'pending']);
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});

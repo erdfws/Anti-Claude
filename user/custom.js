@@ -406,7 +406,14 @@
    * <ul class="contains-task-list"> ever exists for it. Read checklists straight from the step data instead.
    */
   const TASK_LINE_RE = /^\s*(?:[-*+]|\d+[.)])\s+\[([ xX/])\]\s+(.+?)\s*$/;
-  const stepTextSeen = new WeakMap();
+  function stripFencedCode(md) {
+    return String(md || '')
+      .replace(/```[\s\S]*?```/g, '')
+      .replace(/~~~[\s\S]*?~~~/g, '');
+  }
+  function stripAllCode(md) {
+    return stripFencedCode(md).replace(/`[^`\n]+`/g, '');
+  }
   function renderInlineMd(text) {
     return escapeHtml(text)
       .replace(/`([^`]+)`/g, '<code>$1</code>')
@@ -419,7 +426,7 @@
       if (cur && cur.length >= 2 && cur.length <= 15) lists.push(cur);
       cur = null;
     };
-    for (const line of String(md || '').split('\n')) {
+    for (const line of stripFencedCode(md).split('\n')) {
       const m = line.match(TASK_LINE_RE);
       if (m) {
         if (!cur) cur = [];
@@ -437,14 +444,17 @@
   }
   /*
    * The turn container's props hold the complete, ordered step list (independent of what is mounted).
-   * Only the visible response text is used; `thinking` is model reasoning / summaries and is ignored.
-   * Mid-turn progress is signalled via an invisible HTML comment `<!-- todo:N/M -->` (never shown in prose);
-   * legacy visible `〔进度 N/M〕` / `[progress N/M]` lines are also parsed and auto-hidden from the chat stream.
+   * Crucial React 18/19 detail: `turnEl.__reactFiber$` is bound at initial mount and is NOT swapped when React
+   * commits to `fiber.alternate`; we therefore inspect BOTH `f` and `f.alternate` and pick the fresher step array.
+   * Mid-turn progress is signalled via an invisible HTML comment `<!-- todo:N/M -->` (never shown in prose), with
+   * fenced & inline code stripped first so prose examples like `` `〔进度 2/4〕` `` can never pollute progress state.
    */
   const PROGRESS_RE =
     /<!--\s*todo\s*:\s*(\d+)\s*\/\s*(\d+)\s*-->|〔\s*进度\s*(\d+)\s*\/\s*(\d+)\s*〕|\[\s*progress\s*(\d+)\s*\/\s*(\d+)\s*\]/gi;
   const LEGACY_MARKER_LINE_RE = /^\s*(?:〔\s*进度\s*\d+\s*\/\s*\d+\s*〕|\[\s*progress\s*\d+\s*\/\s*\d+\s*\])[^\n]*$/i;
-  const turnProgressMarker = new WeakMap();
+  const turnProgressByTotal = new WeakMap();
+  const stepScanState = new WeakMap();
+
   function hideLegacyProgressParagraphs() {
     for (const p of document.querySelectorAll('[data-testid="agent-response"] p')) {
       if (p.hasAttribute('data-ag-todo-marker-line')) continue;
@@ -457,42 +467,98 @@
       }
     }
   }
+
+  function stepsFromFiberBranch(f) {
+    const p = f && f.memoizedProps;
+    return p && p.container && Array.isArray(p.container.steps) ? p.container.steps : null;
+  }
+
+  function stepTailSig(steps) {
+    if (!steps || !steps.length) return 0;
+    const last = steps[steps.length - 1];
+    const v = last && last.step && last.step.value;
+    const txt = v && typeof v === 'object' ? v.modifiedResponse || v.response || '' : '';
+    return steps.length * 1000000 + txt.length;
+  }
+
   function turnStepsOf(turnEl) {
     const fk = Object.keys(turnEl).find((k) => k.startsWith('__reactFiber$'));
     let f = fk ? turnEl[fk] : null;
+    let best = null;
     for (let i = 0; i < 8 && f; i++, f = f.return) {
-      const p = f.memoizedProps;
-      if (p && p.container && Array.isArray(p.container.steps)) return p.container.steps;
+      const a = stepsFromFiberBranch(f);
+      const b = stepsFromFiberBranch(f.alternate);
+      const pick = stepTailSig(b) > stepTailSig(a) ? b : a;
+      if (pick && stepTailSig(pick) > stepTailSig(best)) {
+        best = pick;
+      }
+      if (best) break;
     }
-    return null;
+    return best;
   }
+
+  function recordProgressMarker(turnEl, total, n) {
+    if (!turnEl || !(n >= 1 && total >= n && total <= 15)) return false;
+    let byTotal = turnProgressByTotal.get(turnEl);
+    if (!byTotal) {
+      byTotal = new Map();
+      turnProgressByTotal.set(turnEl, byTotal);
+    }
+    const prev = byTotal.get(total) || 0;
+    if (n > prev) {
+      byTotal.set(total, n);
+      return true;
+    }
+    return false;
+  }
+
   function harvestStepChecklists(turnEl) {
-    if (!turnEl) return;
+    if (!turnEl) return false;
     const steps = turnStepsOf(turnEl);
-    if (!steps) return;
-    for (const s of steps) {
+    if (!steps || !steps.length) return false;
+    let changed = false;
+    const lastIdx = steps.length - 1;
+    for (let idx = 0; idx < steps.length; idx++) {
+      const s = steps[idx];
       const v = s && s.step && s.step.case === 'plannerResponse' ? s.step.value : null;
       if (!v || typeof v !== 'object') continue;
       const text = v.modifiedResponse || v.response || '';
-      if (!text || stepTextSeen.get(v) === text.length) continue;
-      stepTextSeen.set(v, text.length);
-      for (const items of extractTaskLists(text)) rememberTurnTodo(turnEl, items);
+      if (!text) continue;
+      /* Always re-evaluate the trailing planner step in case SSE appended `<!-- todo:N/M -->` without a DOM childList mutation */
+      if (idx < lastIdx && stepScanState.get(v) === text.length) continue;
+      stepScanState.set(v, text.length);
+
+      for (const items of extractTaskLists(text)) {
+        const before = latestRememberedTodo(turnEl, items);
+        rememberTurnTodo(turnEl, items);
+        const after = latestRememberedTodo(turnEl, items);
+        if (after && (!before || todoSignature(after) !== todoSignature(before))) changed = true;
+      }
+
+      const cleanText = stripAllCode(text);
       PROGRESS_RE.lastIndex = 0;
       let m;
-      let last = null;
-      while ((m = PROGRESS_RE.exec(text))) last = m;
-      if (last) {
-        const n = Number(last[1] || last[3] || last[5]);
-        const total = Number(last[2] || last[4] || last[6]);
-        if (n >= 1 && total >= n && total <= 15) turnProgressMarker.set(turnEl, { n, total });
+      while ((m = PROGRESS_RE.exec(cleanText))) {
+        const n = Number(m[1] || m[3] || m[5]);
+        const total = Number(m[2] || m[4] || m[6]);
+        if (recordProgressMarker(turnEl, total, n)) changed = true;
       }
     }
+    return changed;
   }
-  function applyProgressMarker(turnEl, items) {
-    const mk = turnEl && turnProgressMarker.get(turnEl);
-    if (!mk || !items || mk.total !== items.length) return items;
+
+  function applyProgressMarker(turnEls, items) {
+    if (!items || !items.length) return items;
+    const list = Array.isArray(turnEls) ? turnEls : [turnEls];
+    let maxN = 0;
+    for (const t of list) {
+      const byTotal = t && turnProgressByTotal.get(t);
+      const n = byTotal ? byTotal.get(items.length) || 0 : 0;
+      if (n > maxN) maxN = n;
+    }
+    if (!maxN) return items;
     const next = items.map((it, i) => ({
-      status: i < mk.n - 1 ? 'completed' : i === mk.n - 1 ? 'in_progress' : 'pending',
+      status: i < maxN - 1 ? 'completed' : i === maxN - 1 ? 'in_progress' : 'pending',
       html: it.html
     }));
     return todoProgress(next) > todoProgress(items) ? next : items;
@@ -549,9 +615,17 @@
           if (join) {
             last.lists.push(entry.ul);
             last.items = entry.items;
-            if (entry.turnEl) last.lastTurnEl = entry.turnEl;
+            if (entry.turnEl) {
+              last.lastTurnEl = entry.turnEl;
+              if (!last.turnEls.includes(entry.turnEl)) last.turnEls.push(entry.turnEl);
+            }
           } else if (active) {
-            clusters.push({ lists: [entry.ul], items: entry.items, lastTurnEl: entry.turnEl || null });
+            clusters.push({
+              lists: [entry.ul],
+              items: entry.items,
+              lastTurnEl: entry.turnEl || null,
+              turnEls: entry.turnEl ? [entry.turnEl] : []
+            });
           }
           /* else: ordinary checklist, left untouched */
         }
@@ -568,12 +642,34 @@
         for (let i = 0; i < clusters.length; i++) {
           const cluster = clusters[i];
           for (const ul of cluster.lists) touched.add(ul);
-          /* Antigravity unmounts off-screen steps: the newest mid-turn checklist may no longer be in the DOM. */
-          const remembered = latestRememberedTodo(cluster.lastTurnEl, cluster.items);
-          if (remembered) cluster.items = remembered;
-          cluster.items = applyProgressMarker(cluster.lastTurnEl, cluster.items);
+          for (const tEl of cluster.turnEls) {
+            if (tEl !== latestPaneTurn) harvestStepChecklists(tEl);
+          }
+
+          /* Relay: if a follow-up live turn continues an incomplete checklist without re-emitting <ul>, attach latestPaneTurn */
+          const isLastCluster = i === clusters.length - 1;
+          const canRelayToLatestTurn =
+            paneLive &&
+            isLastCluster &&
+            Boolean(latestPaneTurn) &&
+            !isAllTodoCompleted(cluster.items);
+          const candidateTurns =
+            canRelayToLatestTurn && !cluster.turnEls.includes(latestPaneTurn)
+              ? [...cluster.turnEls, latestPaneTurn]
+              : cluster.turnEls;
+
+          /* Antigravity unmounts off-screen steps: check remembered lists across all turns in the cluster */
+          for (const tEl of candidateTurns) {
+            const remembered = latestRememberedTodo(tEl, cluster.items);
+            if (remembered) cluster.items = remembered;
+          }
+          cluster.items = applyProgressMarker(candidateTurns, cluster.items);
+
           const isDockedLiveCluster =
-            paneLive && i === clusters.length - 1 && Boolean(cluster.lastTurnEl && cluster.lastTurnEl === latestPaneTurn);
+            paneLive &&
+            isLastCluster &&
+            Boolean(latestPaneTurn) &&
+            (cluster.lastTurnEl === latestPaneTurn || !isAllTodoCompleted(cluster.items));
           const mountedDock = isDockedLiveCluster ? renderLiveDockedTodoCard(latestPaneTurn, cluster.items) : null;
 
           if (mountedDock) {
@@ -711,7 +807,11 @@
     }
 
     if (activeCount > 0 && !timerIntervalId) {
-      timerIntervalId = setInterval(() => syncRunningToolIndicators(), 1000);
+      timerIntervalId = setInterval(() => {
+        const ps = collectPanes();
+        syncTodoCards(ps);
+        syncRunningToolIndicators(ps);
+      }, 1000);
     } else if (activeCount === 0 && timerIntervalId) {
       clearInterval(timerIntervalId);
       timerIntervalId = null;

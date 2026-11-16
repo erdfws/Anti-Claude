@@ -331,17 +331,16 @@
     return false;
   }
 
-  function renderLiveDockedTodoCard(pane, items) {
-    const inputBox = pane.inputBox;
-    if (!inputBox || !inputBox.parentElement) return false;
-    let dock = inputBox.parentElement.querySelector(':scope > [data-ag-todo-dock="true"]');
+  function renderLiveDockedTodoCard(turnEl, items) {
+    if (!turnEl) return false;
+    let dock = turnEl.querySelector(':scope > [data-ag-todo-dock="true"]');
     if (!dock) {
       dock = document.createElement('div');
       dock.className = 'ag-claude-todo-live-dock';
       dock.setAttribute('data-ag-todo-dock', 'true');
-      inputBox.insertAdjacentElement('beforebegin', dock);
-    } else if (dock.nextElementSibling !== inputBox) {
-      inputBox.insertAdjacentElement('beforebegin', dock);
+      turnEl.appendChild(dock);
+    } else if (turnEl.lastElementChild !== dock) {
+      turnEl.appendChild(dock);
     }
     let card = dock.querySelector(':scope > .ag-claude-todo-card');
     if (!card) {
@@ -439,11 +438,25 @@
   /*
    * The turn container's props hold the complete, ordered step list (independent of what is mounted).
    * Only the visible response text is used; `thinking` is model reasoning / summaries and is ignored.
-   * Antigravity drops mid-turn narrations that carry a multi-line checklist, so mid-turn progress is
-   * reported as a one-line marker `〔进度 N/M〕` (or `[progress N/M]`), which survives.
+   * Mid-turn progress is signalled via an invisible HTML comment `<!-- todo:N/M -->` (never shown in prose);
+   * legacy visible `〔进度 N/M〕` / `[progress N/M]` lines are also parsed and auto-hidden from the chat stream.
    */
-  const PROGRESS_RE = /〔\s*进度\s*(\d+)\s*\/\s*(\d+)\s*〕|\[\s*progress\s*(\d+)\s*\/\s*(\d+)\s*\]/gi;
+  const PROGRESS_RE =
+    /<!--\s*todo\s*:\s*(\d+)\s*\/\s*(\d+)\s*-->|〔\s*进度\s*(\d+)\s*\/\s*(\d+)\s*〕|\[\s*progress\s*(\d+)\s*\/\s*(\d+)\s*\]/gi;
+  const LEGACY_MARKER_LINE_RE = /^\s*(?:〔\s*进度\s*\d+\s*\/\s*\d+\s*〕|\[\s*progress\s*\d+\s*\/\s*\d+\s*\])[^\n]*$/i;
   const turnProgressMarker = new WeakMap();
+  function hideLegacyProgressParagraphs() {
+    for (const p of document.querySelectorAll('[data-testid="agent-response"] p')) {
+      if (p.hasAttribute('data-ag-todo-marker-line')) continue;
+      if (LEGACY_MARKER_LINE_RE.test((p.textContent || '').trim())) {
+        p.setAttribute('data-ag-todo-marker-line', 'true');
+        const pWrap = p.parentElement;
+        if (pWrap && pWrap.children.length === 1) {
+          pWrap.setAttribute('data-ag-todo-empty-wrap', 'true');
+        }
+      }
+    }
+  }
   function turnStepsOf(turnEl) {
     const fk = Object.keys(turnEl).find((k) => k.startsWith('__reactFiber$'));
     let f = fk ? turnEl[fk] : null;
@@ -469,8 +482,8 @@
       let last = null;
       while ((m = PROGRESS_RE.exec(text))) last = m;
       if (last) {
-        const n = Number(last[1] || last[3]);
-        const total = Number(last[2] || last[4]);
+        const n = Number(last[1] || last[3] || last[5]);
+        const total = Number(last[2] || last[4] || last[6]);
         if (n >= 1 && total >= n && total <= 15) turnProgressMarker.set(turnEl, { n, total });
       }
     }
@@ -498,6 +511,7 @@
     const activeDocks = new Set();
 
     if (FEAT.todoCard) {
+      hideLegacyProgressParagraphs();
       const byPane = new Map();
       for (const ul of document.querySelectorAll('ul.contains-task-list')) {
         const items = parseTodoUl(ul);
@@ -513,6 +527,8 @@
         group.entries.push({ ul, items, turnEl });
         rememberTurnTodo(turnEl, items);
       }
+
+      const handledLiveTurns = new Set();
 
       for (const group of byPane.values()) {
         const clusters = [];
@@ -558,9 +574,10 @@
           cluster.items = applyProgressMarker(cluster.lastTurnEl, cluster.items);
           const isDockedLiveCluster =
             paneLive && i === clusters.length - 1 && Boolean(cluster.lastTurnEl && cluster.lastTurnEl === latestPaneTurn);
-          const mountedDock = isDockedLiveCluster ? renderLiveDockedTodoCard(pane, cluster.items) : null;
+          const mountedDock = isDockedLiveCluster ? renderLiveDockedTodoCard(latestPaneTurn, cluster.items) : null;
 
           if (mountedDock) {
+            handledLiveTurns.add(latestPaneTurn);
             activeDocks.add(mountedDock);
             for (const ul of cluster.lists) markMergedUl(ul);
           } else {
@@ -569,6 +586,28 @@
             for (let j = 0; j < cluster.lists.length - 1; j++) markMergedUl(cluster.lists[j]);
             renderInlineTodoCard(anchorUl, cluster.items, !isAllTodoCompleted(cluster.items));
           }
+        }
+      }
+
+      /* Fallback when ALL <ul> nodes in the live turn were unmounted off-screen by step virtualisation */
+      for (const pane of panes) {
+        if (!isPaneActivelyGenerating(pane)) continue;
+        const paneTurns = pane.root.querySelectorAll('[data-testid="agent-response"]');
+        const latestPaneTurn = paneTurns.length ? paneTurns[paneTurns.length - 1] : null;
+        if (!latestPaneTurn || handledLiveTurns.has(latestPaneTurn)) continue;
+        harvestStepChecklists(latestPaneTurn);
+        const mem = turnTodoMemory.get(latestPaneTurn);
+        if (!mem || mem.size === 0) continue;
+        let best = null;
+        for (const rec of mem.values()) {
+          if (!best || rec.progress > best.progress || (rec.progress === best.progress && rec.seq > best.seq)) {
+            best = rec;
+          }
+        }
+        if (best && hasActiveTodo(best.items)) {
+          const items = applyProgressMarker(latestPaneTurn, best.items);
+          const mountedDock = renderLiveDockedTodoCard(latestPaneTurn, items);
+          if (mountedDock) activeDocks.add(mountedDock);
         }
       }
     }
@@ -1975,11 +2014,14 @@
       )
       .forEach((el) => el.remove());
     document
-      .querySelectorAll('[data-ag-todo-primary], [data-ag-todo-merged], [data-ag-todo-empty-wrap], [data-ag-model-open], [data-ag-inline-stream]')
+      .querySelectorAll(
+        '[data-ag-todo-primary], [data-ag-todo-merged], [data-ag-todo-empty-wrap], [data-ag-todo-marker-line], [data-ag-model-open], [data-ag-inline-stream]'
+      )
       .forEach((el) => {
         el.removeAttribute('data-ag-todo-primary');
         el.removeAttribute('data-ag-todo-merged');
         el.removeAttribute('data-ag-todo-empty-wrap');
+        el.removeAttribute('data-ag-todo-marker-line');
         el.removeAttribute('data-ag-model-open');
         el.removeAttribute('data-ag-inline-stream');
       });

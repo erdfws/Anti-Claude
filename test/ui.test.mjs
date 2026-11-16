@@ -104,11 +104,22 @@ test('cross-turn progress merges into one card; ordinary list in a later turn is
   h.close();
 });
 
-test('live execution checklist docks above the composer', { skip }, () => {
+test('live execution checklist follows the bottom of the active turn in-flow (never fixed outside on composer)', { skip }, async () => {
   const h = mount(pane([ul(li('读代码', 'in_progress'), li('修复'))], { generating: true }));
+  const turn = h.doc.querySelector('[data-testid="agent-response"]');
   const dock = h.doc.querySelector('[data-ag-todo-dock]');
   assert.ok(dock);
-  assert.equal(dock.nextElementSibling.id, 'antigravity.agentSidePanelInputBox');
+  assert.equal(dock.parentElement, turn);
+  assert.equal(turn.lastElementChild, dock);
+  /* when new tool steps append into the turn, the card jumps down below the newest step */
+  const toolStep = h.doc.createElement('div');
+  toolStep.textContent = 'Running tool';
+  turn.appendChild(toolStep);
+  await h.microtasks();
+  await new Promise((r) => setTimeout(r, 100));
+  h.flushFrames();
+  assert.equal(turn.lastElementChild, dock, 'card stays at the very bottom of the active turn');
+  h.cleanups.forEach((fn) => fn());
   h.close();
 });
 
@@ -261,16 +272,18 @@ async function settle(h) {
 
 const dockStatuses = (h) => Array.from(h.doc.querySelectorAll('[data-ag-todo-dock] .ag-claude-todo-row')).map((r) => r.getAttribute('data-status'));
 
-test('one-line 〔进度 N/M〕 marker in turn step data advances the live card', { skip }, async () => {
-  const h = mount(pane([ul(li('切换守护', 'in_progress'), li('真机验证'), li('收尾说明'))], { generating: true }));
-  assert.deepEqual(dockStatuses(h), ['in_progress', 'pending', 'pending']);
-  const { turn, steps } = attachTurnSteps(h, ['开场说明', '守护已切换。〔进度 2/3〕真机验证']);
-  turn.appendChild(h.doc.createElement('p'));
+test('invisible <!-- todo:N/M --> comment advances the live card; legacy 〔进度 N/M〕 lines are hidden', { skip }, async () => {
+  const h = mount(
+    pane([`${ul(li('切换守护', 'in_progress'), li('真机验证'), li('收尾说明'))}<p>〔进度 2/3〕真机验证</p>`], { generating: true })
+  );
+  assert.equal(h.doc.querySelector('p').getAttribute('data-ag-todo-marker-line'), 'true', 'legacy visible marker line is hidden');
+  const { turn, steps } = attachTurnSteps(h, ['开场说明', '守护已切换。<!-- todo:2/3 -->']);
+  turn.appendChild(h.doc.createElement('div'));
   await settle(h);
   assert.deepEqual(dockStatuses(h), ['completed', 'in_progress', 'pending']);
 
-  steps.push({ step: { case: 'plannerResponse', value: { response: '〔进度 3/3〕收尾' } } });
-  turn.appendChild(h.doc.createElement('p'));
+  steps.push({ step: { case: 'plannerResponse', value: { response: '进入收尾。<!-- todo:3/3 -->' } } });
+  turn.appendChild(h.doc.createElement('div'));
   await settle(h);
   assert.deepEqual(dockStatuses(h), ['completed', 'completed', 'in_progress']);
   h.cleanups.forEach((fn) => fn());

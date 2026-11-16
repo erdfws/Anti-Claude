@@ -4,13 +4,20 @@
  * Zero-dependency CLI installer, step-stream unlocker, auto-updater, doctor & uninstaller (Node.js >= 22)
  *
  * Commands:
- *   node install.mjs install          Install/update UX layer, unlock step stream, inject AGENTS.md rule
- *   node install.mjs sync-upgrade     Pull latest GitHub updates & re-apply cleanly on Antigravity app update
- *   node install.mjs auto-update-on   Register macOS LaunchAgent watching Antigravity.app updates + 12h sync
- *   node install.mjs auto-update-off  Remove auto-update LaunchAgent
- *   node install.mjs doctor           Non-destructive health check across all layers
- *   node install.mjs sync-fonts       Copy Anthropic variable fonts from local macOS Claude.app if available
- *   node install.mjs uninstall        Restore previous user/ config, remove auto-updater & AGENTS.md rule block
+ *   node install.mjs install [--no-auto-update] [--no-step-unlock] [--no-agents-rule] [--overwrite-local]
+ *   node install.mjs sync-upgrade [--force] [--overwrite-local]
+ *   node install.mjs auto-update-on | auto-update-off
+ *   node install.mjs doctor
+ *   node install.mjs sync-fonts
+ *   node install.mjs uninstall          Idempotent: a second run is a no-op
+ *
+ * State lives in ~/.gemini/antigravity/claude-ux/ (outside the upstream user/ dir):
+ *   install-state.json   ownership of every file / setting this tool changed + sync timestamps
+ *   backup/              pre-install originals of user/ files
+ *   base/                last deployed template copies (3-way merge base, local-edit detection)
+ *   incoming/            new template versions held back because the user edited the live file
+ *
+ * Exit codes: 0 = ok / partial (see "status"), 1 = failed.
  */
 
 import crypto from 'node:crypto';
@@ -20,28 +27,55 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 const HOME = os.homedir();
 const GEMINI_DIR = path.join(HOME, '.gemini');
 const AGY_DIR = path.join(GEMINI_DIR, 'antigravity');
 const THEME_PATCH_DIR = path.join(AGY_DIR, 'theme-patch');
 const THEME_USER_DIR = path.join(THEME_PATCH_DIR, 'user');
-const BACKUP_DIR = path.join(THEME_USER_DIR, '.backup-before-claude-ux');
-const SYNC_STATE_FILE = path.join(THEME_USER_DIR, '.claude-ux-sync-state.json');
-const SYNC_LOG_FILE = path.join(THEME_USER_DIR, 'auto-sync.log');
 const AGY_STATE_PBTXT = path.join(AGY_DIR, 'antigravity_state.pbtxt');
 const AGY_CONFIG_JSON = path.join(GEMINI_DIR, 'config', 'config.json');
 const AGENTS_MD = path.join(GEMINI_DIR, 'AGENTS.md');
+
+const STATE_DIR = path.join(AGY_DIR, 'claude-ux');
+const STATE_FILE = path.join(STATE_DIR, 'install-state.json');
+const BACKUP_DIR = path.join(STATE_DIR, 'backup');
+const BASE_DIR = path.join(STATE_DIR, 'base');
+const INCOMING_DIR = path.join(STATE_DIR, 'incoming');
+const LOCAL_SAVE_DIR = path.join(STATE_DIR, 'local-saves');
+const SYNC_LOG_FILE = path.join(STATE_DIR, 'auto-sync.log');
+const LAUNCHD_LOG_FILE = path.join(STATE_DIR, 'launchd.log');
+
+/* v1 locations, migrated on first run of this version */
+const LEGACY_BACKUP_DIR = path.join(THEME_USER_DIR, '.backup-before-claude-ux');
+const LEGACY_SYNC_STATE_FILE = path.join(THEME_USER_DIR, '.claude-ux-sync-state.json');
+const LEGACY_SYNC_LOG_FILE = path.join(THEME_USER_DIR, 'auto-sync.log');
 
 const AUTOSYNC_LABEL = 'com.antigravity.claude-ux.autosync';
 const AUTOSYNC_PLIST = path.join(HOME, 'Library', 'LaunchAgents', `${AUTOSYNC_LABEL}.plist`);
 
 const UPSTREAM_REPO = 'https://github.com/Anarcadia/chuanban-antigravity-theme-patch.git';
+/* Verified upstream commit. Bump deliberately after testing; override with CLAUDE_UX_UPSTREAM_REF=HEAD at your own risk. */
+const UPSTREAM_REF = process.env.CLAUDE_UX_UPSTREAM_REF || '6a263b50cb575b22059f4429a9ba9625c0c540df';
 const SELF_REPO = 'https://github.com/hongqi7/antigravity-claude-ux.git';
 const RULE_BEGIN = '<!-- BEGIN antigravity-claude-ux -->';
 const RULE_END = '<!-- END antigravity-claude-ux -->';
 const LEGACY_HEADING = '## 执行过程同步（Claude 式边做边汇报）';
 const USER_LAYER_FILES = ['config.json', 'custom.css', 'custom.js', 'i18n.override.json'];
+const STUB_CONTENT = { 'custom.css': '/* user/custom.css */\n', 'custom.js': '/* user/custom.js */\n' };
+
+const REMOTE_CHECK_INTERVAL_MS = 11 * 3600 * 1000; // < launchd StartInterval (12h)
+const NO_NETWORK = process.env.CLAUDE_UX_NO_NETWORK === '1';
+const NO_LAUNCHD = process.env.CLAUDE_UX_NO_LAUNCHD === '1';
+const NO_CDP = process.env.CLAUDE_UX_NO_CDP === '1';
+const NO_FONTS = process.env.CLAUDE_UX_NO_FONTS === '1';
+const CDP_TIMEOUT_MS = Number(process.env.CLAUDE_UX_CDP_TIMEOUT_MS) || 5000;
+const STATE_SCHEMA = 2;
+
+/* -------------------------------------------------------------------------- */
+/* Generic helpers                                                            */
+/* -------------------------------------------------------------------------- */
 
 function readTextSafe(p) {
   try {
@@ -59,6 +93,21 @@ function readJsonSafe(p, fallback = null) {
   }
 }
 
+function writeFileAtomic(p, content) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const tmp = `${p}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, content, 'utf8');
+  fs.renameSync(tmp, p);
+}
+
+function writeJsonAtomic(p, obj) {
+  writeFileAtomic(p, `${JSON.stringify(obj, null, 2)}\n`);
+}
+
+function sha256Text(t) {
+  return t === null || t === undefined ? '' : crypto.createHash('sha256').update(t).digest('hex');
+}
+
 function sha256File(p) {
   try {
     return crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
@@ -67,16 +116,111 @@ function sha256File(p) {
   }
 }
 
+function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== typeof b || a === null || b === null || typeof a !== 'object') return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  return ka.every((k) => Object.prototype.hasOwnProperty.call(b, k) && deepEqual(a[k], b[k]));
+}
+
+function clone(v) {
+  return v === undefined ? undefined : JSON.parse(JSON.stringify(v));
+}
+
+/**
+ * 3-way JSON merge: base = template we deployed last time, local = live file, remote = new template.
+ * User changes (local vs base) always win; template changes the user did not touch are applied.
+ */
+export function threeWayMergeJson(base, local, remote) {
+  if (deepEqual(local, base)) return clone(remote);
+  if (deepEqual(remote, base)) return clone(local);
+  if (!isPlainObject(base) || !isPlainObject(local) || !isPlainObject(remote)) return clone(local);
+  const out = {};
+  const keys = [...new Set([...Object.keys(remote), ...Object.keys(local)])];
+  for (const k of keys) {
+    const inB = Object.prototype.hasOwnProperty.call(base, k);
+    const inL = Object.prototype.hasOwnProperty.call(local, k);
+    const inR = Object.prototype.hasOwnProperty.call(remote, k);
+    if (inB && !inL) continue; // user deleted the key: respect it
+    if (inB && !inR) {
+      if (inL && !deepEqual(local[k], base[k])) out[k] = clone(local[k]); // template dropped it, user customised it
+      continue;
+    }
+    if (!inB) {
+      if (inL && inR) out[k] = threeWayMergeJson({}, local[k], remote[k]);
+      else out[k] = clone(inL ? local[k] : remote[k]);
+      continue;
+    }
+    out[k] = threeWayMergeJson(base[k], local[k], remote[k]);
+  }
+  return out;
+}
+
+/** Parse the last top-level JSON object printed to stdout (upstream prints daemon logs before its JSON). */
+export function parseTrailingJson(text) {
+  if (!text) return null;
+  const s = String(text);
+  const starts = [];
+  if (s.startsWith('{')) starts.push(0);
+  for (let i = s.indexOf('\n{'); i !== -1; i = s.indexOf('\n{', i + 1)) starts.push(i + 1);
+  for (let j = starts.length - 1; j >= 0; j--) {
+    try {
+      return JSON.parse(s.slice(starts[j]).trim());
+    } catch {}
+  }
+  return null;
+}
+
+export function compareSemver(a, b) {
+  const pa = String(a || '0').split(/[.-]/).map((x) => parseInt(x, 10) || 0);
+  const pb = String(b || '0').split(/[.-]/).map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
+  }
+  return 0;
+}
+
+export function shouldCheckRemote(sync, { now = Date.now(), force = false, appChanged = false } = {}) {
+  if (force || appChanged) return true;
+  const last = Number(sync && sync.lastRemoteCheckAt) || 0;
+  return now - last >= REMOTE_CHECK_INTERVAL_MS;
+}
+
+function xmlEscape(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 function appendSyncLog(msg) {
   try {
-    fs.mkdirSync(THEME_USER_DIR, { recursive: true });
+    fs.mkdirSync(STATE_DIR, { recursive: true });
     const line = `[${new Date().toISOString()}] ${msg}`;
     const prev = readTextSafe(SYNC_LOG_FILE);
     const lines = prev ? prev.trim().split('\n').slice(-199) : [];
     lines.push(line);
-    fs.writeFileSync(SYNC_LOG_FILE, `${lines.join('\n')}\n`, 'utf8');
+    writeFileAtomic(SYNC_LOG_FILE, `${lines.join('\n')}\n`);
   } catch {}
 }
+
+function finalize(report, { critical = [], warnings = [] } = {}) {
+  const status = critical.length ? 'failed' : warnings.length ? 'partial' : 'ok';
+  const out = Object.assign({ ok: status === 'ok', status }, report);
+  if (critical.length) out.errors = critical;
+  if (warnings.length) out.warnings = warnings;
+  console.log(JSON.stringify(out, null, 2));
+  if (status === 'failed') process.exitCode = 1;
+  return out;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Environment probes                                                         */
+/* -------------------------------------------------------------------------- */
 
 function getAntigravityAppFingerprint() {
   if (process.platform === 'darwin') {
@@ -85,19 +229,20 @@ function getAntigravityAppFingerprint() {
     let version = 'unknown';
     try {
       version = execFileSync('plutil', ['-extract', 'CFBundleShortVersionString', 'raw', '-o', '-', plist], {
-        encoding: 'utf8'
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore']
       }).trim();
     } catch {}
     let asarSig = 'missing';
-    let asarMtimeMs = 0;
+    let changedAtMs = 0;
     try {
       const st = fs.statSync(asar);
-      asarMtimeMs = st.mtimeMs;
+      changedAtMs = Math.max(st.mtimeMs, st.ctimeMs);
       asarSig = `${st.size}:${Math.floor(st.mtimeMs)}`;
     } catch {}
-    return { version, asarSig, asarMtimeMs, sig: `${version}|${asarSig}` };
+    return { version, asarSig, changedAtMs, sig: `${version}|${asarSig}` };
   }
-  return { version: 'unknown', asarSig: 'unknown', asarMtimeMs: 0, sig: process.platform };
+  return { version: 'unknown', asarSig: 'unknown', changedAtMs: 0, sig: process.platform };
 }
 
 function getDevToolsPortFile() {
@@ -124,22 +269,20 @@ function checkFontsInstalled() {
   const dir = getUserFontsDir();
   try {
     const files = fs.readdirSync(dir);
-    const hasAnthropicSans = files.some((f) => /AnthropicSans/i.test(f));
-    const hasAnthropicSerif = files.some((f) => /AnthropicSerif/i.test(f));
-    return { dir, hasAnthropicSans, hasAnthropicSerif };
+    return {
+      dir,
+      hasAnthropicSans: files.some((f) => /AnthropicSans/i.test(f)),
+      hasAnthropicSerif: files.some((f) => /AnthropicSerif/i.test(f))
+    };
   } catch {
     return { dir, hasAnthropicSans: false, hasAnthropicSerif: false };
   }
 }
 
 function syncFontsFromLocalClaudeApp() {
-  if (process.platform !== 'darwin') {
-    return { synced: false, reason: 'not_macos' };
-  }
+  if (process.platform !== 'darwin') return { synced: false, reason: 'not_macos' };
   const claudeFontsDir = '/Applications/Claude.app/Contents/Resources/fonts';
-  if (!fs.existsSync(claudeFontsDir)) {
-    return { synced: false, reason: 'claude_app_not_installed' };
-  }
+  if (!fs.existsSync(claudeFontsDir)) return { synced: false, reason: 'claude_app_not_installed' };
   const destDir = getUserFontsDir();
   fs.mkdirSync(destDir, { recursive: true });
   const copied = [];
@@ -152,36 +295,149 @@ function syncFontsFromLocalClaudeApp() {
       }
     }
   }
-  return { synced: true, copied };
+  return { synced: true, copied, note: 'Fonts are copied from your own local Claude.app for personal use only.' };
 }
 
-function ensureOrUpgradeUpstreamThemePatch({ checkRemoteUpdate = false } = {}) {
+/** Prefer a version-independent node path so `brew upgrade node` does not break the LaunchAgent. */
+export function stableNodePath(execPath = process.execPath) {
+  const candidates = ['/opt/homebrew/bin/node', '/usr/local/bin/node'];
+  let realExec = execPath;
+  try {
+    realExec = fs.realpathSync(execPath);
+  } catch {}
+  for (const c of candidates) {
+    try {
+      if (fs.realpathSync(c) === realExec) return c;
+    } catch {}
+  }
+  if (/\/Cellar\/node(@[\d.]+)?\//.test(execPath)) {
+    for (const c of candidates) if (fs.existsSync(c)) return c;
+  }
+  return execPath;
+}
+
+/* -------------------------------------------------------------------------- */
+/* State (ownership manifest)                                                 */
+/* -------------------------------------------------------------------------- */
+
+function newState() {
+  return {
+    schema: STATE_SCHEMA,
+    installedAt: Date.now(),
+    repoUrl: SELF_REPO,
+    options: { stepUnlock: true, agentsRule: true, autoUpdate: true },
+    files: {},
+    settings: {},
+    agentsRule: { inserted: false },
+    sync: {}
+  };
+}
+
+function migrateLegacyState() {
+  const hasLegacyBackup = fs.existsSync(LEGACY_BACKUP_DIR);
+  const legacySync = readJsonSafe(LEGACY_SYNC_STATE_FILE, null);
+  if (!hasLegacyBackup && !legacySync) return null;
+  const state = newState();
+  state.migratedFrom = 'v1';
+  fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  fs.mkdirSync(BASE_DIR, { recursive: true });
+  for (const f of USER_LAYER_FILES) {
+    const legacyBak = path.join(LEGACY_BACKUP_DIR, f);
+    const live = path.join(THEME_USER_DIR, f);
+    const hasBak = hasLegacyBackup && fs.existsSync(legacyBak);
+    if (hasBak) fs.copyFileSync(legacyBak, path.join(BACKUP_DIR, f));
+    if (fs.existsSync(live)) {
+      /* v1 deployed whatever is live now; treat it as the merge base */
+      fs.copyFileSync(live, path.join(BASE_DIR, f));
+      state.files[f] = { existedBefore: hasBak ? true : null, deployedSha: sha256File(live) };
+    }
+  }
+  /* v1 did not record previous settings: unknown -> never auto-revert */
+  state.settings = { legacyUnknown: true };
+  if (legacySync) {
+    state.installedAt = Number(legacySync.lastSyncAt) || state.installedAt;
+    state.sync = {
+      appVersion: legacySync.appVersion,
+      appSig: legacySync.appSig,
+      lastAppliedAt: legacySync.lastSyncAt,
+      lastRemoteCheckAt: 0
+    };
+  }
+  const agentsRaw = readTextSafe(AGENTS_MD) || '';
+  state.agentsRule.inserted = agentsRaw.includes(RULE_BEGIN);
+  state.options.autoUpdate = fs.existsSync(AUTOSYNC_PLIST);
+  saveState(state);
+  fs.rmSync(LEGACY_BACKUP_DIR, { recursive: true, force: true });
+  fs.rmSync(LEGACY_SYNC_STATE_FILE, { force: true });
+  return state;
+}
+
+function loadState() {
+  const st = readJsonSafe(STATE_FILE, null);
+  if (st && st.schema === STATE_SCHEMA) return st;
+  return migrateLegacyState();
+}
+
+function saveState(state) {
+  writeJsonAtomic(STATE_FILE, state);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Source validation & repos                                                  */
+/* -------------------------------------------------------------------------- */
+
+function validateSourceRoot(root = __dirname) {
+  const problems = [];
+  for (const rel of ['install.mjs', 'user/custom.js']) {
+    try {
+      execFileSync(process.execPath, ['--check', path.join(root, rel)], { stdio: 'pipe' });
+    } catch (err) {
+      problems.push(`${rel}: ${String(err.stderr || err.message).split('\n')[0]}`);
+    }
+  }
+  for (const rel of ['user/config.json', 'user/i18n.override.json']) {
+    if (readJsonSafe(path.join(root, rel), undefined) === undefined) problems.push(`${rel}: invalid JSON`);
+  }
+  if (!fs.existsSync(path.join(root, 'rules', 'claude-execution-sync.md'))) problems.push('rules/claude-execution-sync.md missing');
+  return { ok: problems.length === 0, problems };
+}
+
+function cloneUpstreamAtRef(tmpDir, quiet) {
+  const stdio = quiet ? 'pipe' : 'inherit';
+  if (UPSTREAM_REF === 'HEAD') {
+    execFileSync('git', ['clone', '--depth', '1', UPSTREAM_REPO, tmpDir], { stdio, timeout: 30000 });
+    return;
+  }
+  execFileSync('git', ['init', '-q', tmpDir], { stdio, timeout: 10000 });
+  execFileSync('git', ['-C', tmpDir, 'fetch', '--depth', '1', '--quiet', UPSTREAM_REPO, UPSTREAM_REF], { stdio, timeout: 30000 });
+  execFileSync('git', ['-C', tmpDir, 'checkout', '-q', 'FETCH_HEAD'], { stdio, timeout: 10000 });
+}
+
+/**
+ * Install the upstream core if missing; with `upgrade`, move it to the pinned ref only when the pinned
+ * manifest version is newer than the local one (never downgrades a manually upgraded core).
+ */
+function ensureUpstreamCore({ upgrade = false } = {}) {
   const upstreamEntry = path.join(THEME_PATCH_DIR, 'install.mjs');
   const localInstalled = fs.existsSync(upstreamEntry);
-  if (localInstalled && !checkRemoteUpdate) {
-    return { alreadyInstalled: true, upgraded: false, path: THEME_PATCH_DIR };
-  }
+  if (localInstalled && (!upgrade || NO_NETWORK)) return { installed: true, upgraded: false };
+  if (!localInstalled && NO_NETWORK) throw new Error('upstream core missing and CLAUDE_UX_NO_NETWORK=1');
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chuanban-base-'));
   try {
-    execFileSync('git', ['clone', '--depth', '1', UPSTREAM_REPO, tmpDir], {
-      stdio: localInstalled ? 'pipe' : 'inherit',
-      timeout: 25000
-    });
-    const remoteManifestSha = sha256File(path.join(tmpDir, 'core', 'manifest.json'));
-    const localManifestSha = sha256File(path.join(THEME_PATCH_DIR, 'core', 'manifest.json'));
-    if (localInstalled && remoteManifestSha && remoteManifestSha === localManifestSha) {
-      return { alreadyInstalled: true, upgraded: false, upToDate: true, path: THEME_PATCH_DIR };
+    cloneUpstreamAtRef(tmpDir, localInstalled);
+    const remoteVer = readJsonSafe(path.join(tmpDir, 'core', 'manifest.json'), {})?.version;
+    const localVer = readJsonSafe(path.join(THEME_PATCH_DIR, 'core', 'manifest.json'), {})?.version;
+    if (localInstalled && compareSemver(remoteVer, localVer) <= 0) {
+      return { installed: true, upgraded: false, upToDate: true, localVersion: localVer, pinnedVersion: remoteVer };
     }
     execFileSync(process.execPath, [path.join(tmpDir, 'install.mjs'), 'install'], {
       stdio: localInstalled ? 'pipe' : 'inherit',
-      timeout: 30000
+      timeout: 60000
     });
-    return { alreadyInstalled: localInstalled, upgraded: true, path: THEME_PATCH_DIR };
+    return { installed: true, upgraded: localInstalled, freshInstall: !localInstalled, ref: UPSTREAM_REF, version: remoteVer };
   } catch (err) {
-    if (localInstalled) {
-      return { alreadyInstalled: true, upgraded: false, networkSkipped: String(err?.message || err) };
-    }
+    if (localInstalled) return { installed: true, upgraded: false, error: String(err?.message || err).split('\n')[0] };
     throw err;
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -189,30 +445,26 @@ function ensureOrUpgradeUpstreamThemePatch({ checkRemoteUpdate = false } = {}) {
 }
 
 function pullSelfRepoIfGit() {
-  if (!fs.existsSync(path.join(__dirname, '.git'))) {
-    return { pulled: false, reason: 'not_git_checkout' };
-  }
+  if (!fs.existsSync(path.join(__dirname, '.git'))) return { pulled: false, reason: 'not_git_checkout' };
   try {
-    const beforeHead = execFileSync('git', ['-C', __dirname, 'rev-parse', '--short', 'HEAD'], {
-      encoding: 'utf8'
-    }).trim();
-    execFileSync('git', ['-C', __dirname, 'pull', '--ff-only', '--quiet'], {
-      stdio: 'pipe',
-      timeout: 20000
-    });
-    const afterHead = execFileSync('git', ['-C', __dirname, 'rev-parse', '--short', 'HEAD'], {
-      encoding: 'utf8'
-    }).trim();
+    const head = () => execFileSync('git', ['-C', __dirname, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8' }).trim();
+    const beforeHead = head();
+    execFileSync('git', ['-C', __dirname, 'pull', '--ff-only', '--quiet'], { stdio: 'pipe', timeout: 20000 });
+    const afterHead = head();
     return { pulled: true, updated: beforeHead !== afterHead, beforeHead, afterHead };
   } catch (err) {
-    return { pulled: false, reason: String(err?.message || err) };
+    return { pulled: false, error: String(err?.stderr || err?.message || err).split('\n')[0] };
   }
 }
 
-async function unlockStepsViaLiveCdp() {
-  const portFile = getDevToolsPortFile();
-  const raw = readTextSafe(portFile);
-  if (!raw) return { ok: false, reason: 'no_devtools_port_file' };
+/* -------------------------------------------------------------------------- */
+/* Live CDP (with per-request deadline and close/error handling)              */
+/* -------------------------------------------------------------------------- */
+
+export async function withCdpPage(fn, { timeoutMs = CDP_TIMEOUT_MS } = {}) {
+  if (NO_CDP) return { ok: false, reason: 'cdp_disabled', appRunning: false };
+  const raw = readTextSafe(getDevToolsPortFile());
+  if (!raw) return { ok: false, reason: 'app_not_running', appRunning: false };
   const [port] = raw.trim().split(/\r?\n/);
   if (!port) return { ok: false, reason: 'empty_port' };
 
@@ -221,82 +473,61 @@ async function unlockStepsViaLiveCdp() {
     const res = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(2000) });
     const list = await res.json();
     const target = list.find((x) => x.type === 'page' && String(x.url).includes('127.0.0.1:'));
-    if (!target || !target.webSocketDebuggerUrl) {
-      return { ok: false, reason: 'main_page_not_found' };
-    }
+    if (!target || !target.webSocketDebuggerUrl) return { ok: false, reason: 'main_page_not_found' };
 
     ws = new WebSocket(target.webSocketDebuggerUrl);
-    await new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error('ws_timeout')), 2500);
-      ws.addEventListener(
-        'open',
-        () => {
-          clearTimeout(t);
-          resolve();
-        },
-        { once: true }
-      );
-      ws.addEventListener(
-        'error',
-        (err) => {
-          clearTimeout(t);
-          reject(err);
-        },
-        { once: true }
-      );
-    });
-
-    const evalFn = async function () {
-      const allEls = document.querySelectorAll('#root *');
-      let prefStore = null;
-      for (const el of allEls) {
-        const key = Object.keys(el).find((k) => k.startsWith('__reactFiber$'));
-        if (!key) continue;
-        for (let f = el[key]; f && !prefStore; f = f.return) {
-          for (let d = f.dependencies?.firstContext; d; d = d.next) {
-            const v = d.memoizedValue;
-            if (v && typeof v.getState === 'function') {
-              const st = v.getState();
-              if (st && typeof st.setPrefValue === 'function') {
-                prefStore = v;
-                break;
-              }
-            }
-          }
-        }
-        if (prefStore) break;
-      }
-      if (!prefStore) return { found: false };
-      const st = prefStore.getState();
-      await st.setPrefValue('project4kMode', 1);
-      await st.setPrefValue('verboseConversationSteps', true);
-      return {
-        found: true,
-        project4kMode: prefStore.getState().getPrefValue('project4kMode'),
-        verboseConversationSteps: prefStore.getState().getPrefValue('verboseConversationSteps')
-      };
+    const pending = new Map();
+    let closedReason = null;
+    const failAll = (reason) => {
+      closedReason = closedReason || reason;
+      for (const [, p] of pending) p.reject(new Error(reason));
+      pending.clear();
     };
+    ws.addEventListener('message', (ev) => {
+      let d;
+      try {
+        d = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      const p = pending.get(d.id);
+      if (p) {
+        pending.delete(d.id);
+        p.resolve(d);
+      }
+    });
+    ws.addEventListener('close', () => failAll('ws_closed'));
+    ws.addEventListener('error', () => failAll('ws_error'));
 
-    const msgPromise = new Promise((resolve) => {
-      const handler = (ev) => {
-        const d = JSON.parse(ev.data);
-        if (d.id === 1) {
-          ws.removeEventListener('message', handler);
-          resolve(d);
-        }
-      };
-      ws.addEventListener('message', handler);
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error('ws_open_timeout')), 2500);
+      ws.addEventListener('open', () => (clearTimeout(t), resolve()), { once: true });
+      ws.addEventListener('close', () => (clearTimeout(t), reject(new Error('ws_closed'))), { once: true });
+      ws.addEventListener('error', () => (clearTimeout(t), reject(new Error('ws_error'))), { once: true });
     });
 
-    ws.send(
-      JSON.stringify({
-        id: 1,
-        method: 'Runtime.evaluate',
-        params: { expression: `(${evalFn.toString()})()`, awaitPromise: true, returnByValue: true }
-      })
-    );
-    const out = await msgPromise;
-    return { ok: true, cdp: out?.result?.result?.value || null };
+    let nextId = 1;
+    const send = (method, params = {}) =>
+      new Promise((resolve, reject) => {
+        if (closedReason) return reject(new Error(closedReason));
+        const id = nextId++;
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error('cdp_timeout'));
+        }, timeoutMs);
+        pending.set(id, {
+          resolve: (v) => (clearTimeout(timer), resolve(v)),
+          reject: (e) => (clearTimeout(timer), reject(e))
+        });
+        try {
+          ws.send(JSON.stringify({ id, method, params }));
+        } catch (err) {
+          pending.delete(id);
+          clearTimeout(timer);
+          reject(err);
+        }
+      });
+    return await fn(send);
   } catch (err) {
     return { ok: false, reason: String(err?.message || err) };
   } finally {
@@ -306,113 +537,320 @@ async function unlockStepsViaLiveCdp() {
   }
 }
 
-function unlockStepsInConfigFiles() {
+/** Read (and optionally set) Antigravity preference values through the live React pref store. */
+export async function cdpPrefs(setMap) {
+  const keys = ['project4kMode', 'verboseConversationSteps'];
+  const pageFn = async function (keys, setMap) {
+    let prefStore = null;
+    for (const el of document.querySelectorAll('#root *')) {
+      const key = Object.keys(el).find((k) => k.startsWith('__reactFiber$'));
+      if (!key) continue;
+      for (let f = el[key]; f && !prefStore; f = f.return) {
+        for (let d = f.dependencies?.firstContext; d; d = d.next) {
+          const v = d.memoizedValue;
+          if (v && typeof v.getState === 'function') {
+            const st = v.getState();
+            if (st && typeof st.setPrefValue === 'function' && typeof st.getPrefValue === 'function') {
+              prefStore = v;
+              break;
+            }
+          }
+        }
+      }
+      if (prefStore) break;
+    }
+    if (!prefStore) return { found: false };
+    const read = () => Object.fromEntries(keys.map((k) => [k, prefStore.getState().getPrefValue(k)]));
+    const before = read();
+    if (setMap) {
+      for (const [k, v] of Object.entries(setMap)) await prefStore.getState().setPrefValue(k, v);
+    }
+    return { found: true, before, after: read() };
+  };
+  return withCdpPage(async (send) => {
+    const r = await send('Runtime.evaluate', {
+      expression: `(${pageFn.toString()})(${JSON.stringify(keys)}, ${JSON.stringify(setMap || null)})`,
+      awaitPromise: true,
+      returnByValue: true
+    });
+    if (r.error) return { ok: false, reason: `cdp_error: ${r.error.message || JSON.stringify(r.error)}` };
+    if (r.result?.exceptionDetails) {
+      const ex = r.result.exceptionDetails;
+      return { ok: false, reason: `eval_exception: ${ex.exception?.description || ex.text || 'unknown'}` };
+    }
+    const v = r.result?.result?.value;
+    if (!v || !v.found) return { ok: false, reason: 'pref_store_not_found' };
+    const applied = !setMap || Object.entries(setMap).every(([k, val]) => v.after[k] === val);
+    return { ok: applied, reason: applied ? undefined : 'pref_not_applied', before: v.before, after: v.after };
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Step-stream settings (recorded for rollback)                               */
+/* -------------------------------------------------------------------------- */
+
+async function applyStepUnlock(state) {
+  const settings = (state.settings = state.settings || {});
+  const live = await cdpPrefs({ project4kMode: 1, verboseConversationSteps: true });
+  if (live.before && !settings.live) settings.live = { captured: true, before: live.before };
+
   const actions = [];
   if (fs.existsSync(AGY_STATE_PBTXT)) {
     const content = fs.readFileSync(AGY_STATE_PBTXT, 'utf8');
-    if (content.includes('PRODUCT_SKIN_NON_TECHNICAL')) {
-      const updated = content.replace(/product_skin:\s*PRODUCT_SKIN_NON_TECHNICAL/g, 'product_skin: PRODUCT_SKIN_DEVELOPER');
-      fs.writeFileSync(AGY_STATE_PBTXT, updated, 'utf8');
-      actions.push('updated_pbtxt_developer_skin');
+    if (/product_skin:\s*PRODUCT_SKIN_NON_TECHNICAL/.test(content)) {
+      writeFileAtomic(AGY_STATE_PBTXT, content.replace(/product_skin:\s*PRODUCT_SKIN_NON_TECHNICAL/g, 'product_skin: PRODUCT_SKIN_DEVELOPER'));
+      settings.pbtxt = { changed: true, before: 'PRODUCT_SKIN_NON_TECHNICAL' };
+      actions.push('pbtxt_developer_skin');
+    } else if (!settings.pbtxt) {
+      settings.pbtxt = { changed: false };
     }
   }
   if (fs.existsSync(AGY_CONFIG_JSON)) {
-    try {
-      const cfg = JSON.parse(fs.readFileSync(AGY_CONFIG_JSON, 'utf8'));
+    const cfg = readJsonSafe(AGY_CONFIG_JSON, null);
+    if (cfg) {
       cfg.userSettings = cfg.userSettings || {};
       if (cfg.userSettings.verboseConversationSteps !== true) {
+        if (!settings.verbose?.changed) {
+          settings.verbose = {
+            changed: true,
+            hadKey: Object.prototype.hasOwnProperty.call(cfg.userSettings, 'verboseConversationSteps'),
+            before: cfg.userSettings.verboseConversationSteps
+          };
+        }
         cfg.userSettings.verboseConversationSteps = true;
-        fs.writeFileSync(AGY_CONFIG_JSON, `${JSON.stringify(cfg, null, 2)}\n`, 'utf8');
-        actions.push('enabled_verbose_steps_in_config_json');
+        writeJsonAtomic(AGY_CONFIG_JSON, cfg);
+        actions.push('config_json_verbose_steps');
+      } else if (!settings.verbose) {
+        settings.verbose = { changed: false };
       }
-    } catch {}
+    }
   }
-  return actions;
+  return { live, fileActions: actions };
 }
 
-function injectAgentsMdRule(sourceRoot = __dirname) {
-  const ruleBlock = fs.readFileSync(path.join(sourceRoot, 'rules', 'claude-execution-sync.md'), 'utf8').trim();
-  fs.mkdirSync(path.dirname(AGENTS_MD), { recursive: true });
-  const existing = readTextSafe(AGENTS_MD) || '';
+async function revertStepUnlock(state) {
+  const settings = state.settings || {};
+  const out = { live: null, files: [] };
+  const recorded = Boolean(settings.live?.captured || settings.pbtxt?.changed || settings.verbose?.changed);
+  if (settings.legacyUnknown && !recorded) {
+    out.note = 'installed by v1, previous settings unknown: step settings left as-is';
+    return out;
+  }
+  const liveBefore = settings.live?.captured ? settings.live.before : null;
+  const restoreLive = {};
+  if (liveBefore) {
+    for (const [k, v] of Object.entries(liveBefore)) {
+      if (v !== undefined && v !== null) restoreLive[k] = v;
+    }
+  }
+  if (Object.keys(restoreLive).length) out.live = await cdpPrefs(restoreLive);
 
-  if (existing.includes(RULE_BEGIN) && existing.includes(RULE_END)) {
-    const re = new RegExp(`${RULE_BEGIN}[\\s\\S]*?${RULE_END}`);
-    const next = existing.replace(re, ruleBlock);
-    if (next !== existing) fs.writeFileSync(AGENTS_MD, next, 'utf8');
-    return 'updated_marked_block';
+  if (settings.pbtxt?.changed && fs.existsSync(AGY_STATE_PBTXT)) {
+    const content = fs.readFileSync(AGY_STATE_PBTXT, 'utf8');
+    if (/product_skin:\s*PRODUCT_SKIN_DEVELOPER/.test(content)) {
+      writeFileAtomic(AGY_STATE_PBTXT, content.replace(/product_skin:\s*PRODUCT_SKIN_DEVELOPER/g, `product_skin: ${settings.pbtxt.before}`));
+      out.files.push('pbtxt_restored');
+    }
   }
-  if (existing.includes(LEGACY_HEADING)) {
-    return 'already_present_unmarked';
+  if (settings.verbose?.changed && fs.existsSync(AGY_CONFIG_JSON)) {
+    const cfg = readJsonSafe(AGY_CONFIG_JSON, null);
+    if (cfg?.userSettings && cfg.userSettings.verboseConversationSteps === true) {
+      if (settings.verbose.hadKey) cfg.userSettings.verboseConversationSteps = settings.verbose.before;
+      else delete cfg.userSettings.verboseConversationSteps;
+      writeJsonAtomic(AGY_CONFIG_JSON, cfg);
+      out.files.push('verbose_restored');
+    }
   }
+  return out;
+}
+
+/* -------------------------------------------------------------------------- */
+/* AGENTS.md rule                                                             */
+/* -------------------------------------------------------------------------- */
+
+function injectAgentsMdRule(state, { allowInsert }) {
+  const ruleBlock = fs.readFileSync(path.join(__dirname, 'rules', 'claude-execution-sync.md'), 'utf8').trim();
+  const existing = readTextSafe(AGENTS_MD) || '';
+  const begin = existing.indexOf(RULE_BEGIN);
+  const end = existing.indexOf(RULE_END);
+  if (begin !== -1 && end > begin) {
+    const next = existing.slice(0, begin) + ruleBlock + existing.slice(end + RULE_END.length);
+    if (next !== existing) writeFileAtomic(AGENTS_MD, next);
+    return next !== existing ? 'updated_marked_block' : 'unchanged';
+  }
+  if (existing.includes(LEGACY_HEADING)) return 'already_present_unmarked';
+  if (!allowInsert) return 'absent_respected'; // user removed it: background sync never re-adds
   const sep = existing.trim() ? '\n\n---\n\n' : '';
-  fs.writeFileSync(AGENTS_MD, `${ruleBlock}${sep}${existing}`, 'utf8');
+  writeFileAtomic(AGENTS_MD, `${ruleBlock}${sep}${existing}`);
+  state.agentsRule = { inserted: true };
   return 'prepended_rule_block';
 }
 
 function removeAgentsMdRule() {
   const existing = readTextSafe(AGENTS_MD);
-  if (!existing || !existing.includes(RULE_BEGIN)) return false;
-  const re = new RegExp(`${RULE_BEGIN}[\\s\\S]*?${RULE_END}\\s*(?:---\\s*)?`, 'g');
-  const next = existing.replace(re, '').replace(/^\s+/, '');
-  fs.writeFileSync(AGENTS_MD, next, 'utf8');
+  if (!existing) return false;
+  const begin = existing.indexOf(RULE_BEGIN);
+  const end = existing.indexOf(RULE_END);
+  if (begin === -1 || end < begin) return false;
+  let tail = existing.slice(end + RULE_END.length);
+  tail = tail.replace(/^\s*(?:---\s*)?/, '');
+  const head = existing.slice(0, begin);
+  writeFileAtomic(AGENTS_MD, (head + tail).replace(/^\s+/, ''));
   return true;
 }
 
-function installUserLayer(sourceRoot = __dirname) {
+/* -------------------------------------------------------------------------- */
+/* User layer deploy / restore                                                */
+/* -------------------------------------------------------------------------- */
+
+function deployFile(f, text, state) {
+  writeFileAtomic(path.join(THEME_USER_DIR, f), text);
+  writeFileAtomic(path.join(BASE_DIR, f), text);
+  state.files[f].deployedSha = sha256Text(text);
+  fs.rmSync(path.join(INCOMING_DIR, f), { force: true });
+}
+
+function installUserLayer(state, { sourceRoot = __dirname, overwriteLocal = false } = {}) {
   fs.mkdirSync(THEME_USER_DIR, { recursive: true });
-  if (!fs.existsSync(BACKUP_DIR)) {
-    fs.mkdirSync(BACKUP_DIR, { recursive: true });
-    for (const f of USER_LAYER_FILES) {
-      const cur = path.join(THEME_USER_DIR, f);
-      if (fs.existsSync(cur)) {
-        fs.copyFileSync(cur, path.join(BACKUP_DIR, f));
-      }
-    }
-  }
-  const copied = [];
+  const result = { created: [], updated: [], merged: [], conflicts: [], unchanged: [] };
   for (const f of USER_LAYER_FILES) {
     const src = path.join(sourceRoot, 'user', f);
+    const srcText = readTextSafe(src);
+    if (srcText === null) continue;
     const dst = path.join(THEME_USER_DIR, f);
-    if (fs.existsSync(src)) {
-      if (sha256File(src) !== sha256File(dst)) {
-        fs.copyFileSync(src, dst);
-        copied.push(f);
+    const localText = readTextSafe(dst);
+    let entry = state.files[f];
+
+    if (!entry) {
+      if (localText !== null) {
+        fs.mkdirSync(BACKUP_DIR, { recursive: true });
+        fs.writeFileSync(path.join(BACKUP_DIR, f), localText, 'utf8');
       }
+      entry = state.files[f] = { existedBefore: localText !== null, deployedSha: '' };
+      deployFile(f, srcText, state);
+      result.created.push(f);
+      continue;
+    }
+    if (localText === null) {
+      deployFile(f, srcText, state);
+      result.updated.push(f);
+      continue;
+    }
+    if (localText === srcText) {
+      if (readTextSafe(path.join(BASE_DIR, f)) !== srcText) deployFile(f, srcText, state);
+      result.unchanged.push(f);
+      continue;
+    }
+    const baseText = readTextSafe(path.join(BASE_DIR, f));
+    const localUntouched = baseText !== null ? localText === baseText : sha256Text(localText) === entry.deployedSha;
+    if (localUntouched) {
+      deployFile(f, srcText, state);
+      result.updated.push(f);
+      continue;
+    }
+    if (overwriteLocal) {
+      writeFileAtomic(path.join(LOCAL_SAVE_DIR, `${new Date().toISOString().replace(/[:.]/g, '-')}-${f}`), localText);
+      deployFile(f, srcText, state);
+      result.updated.push(`${f} (local edits saved to local-saves/)`);
+      continue;
+    }
+    if (f.endsWith('.json') && baseText !== null) {
+      try {
+        const merged = threeWayMergeJson(JSON.parse(baseText), JSON.parse(localText), JSON.parse(srcText));
+        const mergedText = `${JSON.stringify(merged, null, 2)}\n`;
+        if (mergedText !== localText) writeFileAtomic(dst, mergedText);
+        writeFileAtomic(path.join(BASE_DIR, f), srcText); // base tracks the template, local keeps user overrides
+        entry.deployedSha = sha256Text(mergedText);
+        result.merged.push(f);
+        continue;
+      } catch {}
+    }
+    if (baseText === srcText) {
+      result.unchanged.push(`${f} (local edits kept)`);
+      continue;
+    }
+    writeFileAtomic(path.join(INCOMING_DIR, f), srcText);
+    result.conflicts.push(f);
+  }
+  return result;
+}
+
+function restoreUserLayer(state) {
+  const out = { restored: [], removed: [], stubbed: [], kept: [], savedLocalEdits: [] };
+  const saveDir = path.join(AGY_DIR, `claude-ux-uninstall-saved-${new Date().toISOString().replace(/[:.]/g, '-')}`);
+  for (const f of USER_LAYER_FILES) {
+    const entry = state.files?.[f];
+    if (!entry) continue;
+    const dst = path.join(THEME_USER_DIR, f);
+    const cur = readTextSafe(dst);
+    const base = readTextSafe(path.join(BASE_DIR, f));
+    if (cur !== null && base !== null && cur !== base) {
+      fs.mkdirSync(saveDir, { recursive: true });
+      fs.writeFileSync(path.join(saveDir, f), cur, 'utf8');
+      out.savedLocalEdits.push(path.join(saveDir, f));
+    }
+    const bak = path.join(BACKUP_DIR, f);
+    if (entry.existedBefore === true && fs.existsSync(bak)) {
+      fs.copyFileSync(bak, dst);
+      out.restored.push(f);
+    } else if (entry.existedBefore === false) {
+      fs.rmSync(dst, { force: true });
+      out.removed.push(f);
+    } else if (STUB_CONTENT[f]) {
+      writeFileAtomic(dst, STUB_CONTENT[f]);
+      out.stubbed.push(f);
+    } else {
+      out.kept.push(f);
     }
   }
-  return copied;
+  return out;
 }
 
 function runUpstreamVerify() {
   const upstreamEntry = path.join(THEME_PATCH_DIR, 'install.mjs');
   if (!fs.existsSync(upstreamEntry)) return { ok: false, reason: 'upstream_missing' };
+  let stdout = '';
+  let exitStatus = 0;
   try {
-    const out = execFileSync(process.execPath, [upstreamEntry, 'verify'], { encoding: 'utf8', timeout: 15000 });
-    return { ok: true, output: out.trim() };
+    stdout = execFileSync(process.execPath, [upstreamEntry, 'verify'], {
+      encoding: 'utf8',
+      timeout: 20000,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
   } catch (err) {
-    return { ok: false, reason: String(err?.message || err) };
+    stdout = String(err?.stdout || '');
+    exitStatus = typeof err?.status === 'number' ? err.status : -1;
+    if (!stdout) return { ok: false, exitStatus, reason: String(err?.message || err).split('\n')[0] };
   }
+  const parsed = parseTrailingJson(stdout);
+  if (!parsed) return { ok: false, exitStatus, reason: 'verify_output_unparseable' };
+  const ok = exitStatus === 0 && parsed.ok === true;
+  return {
+    ok,
+    exitStatus,
+    themeStyle: parsed.themeStyle ?? null,
+    reachable: parsed.live?.reachable ?? null,
+    reason: ok ? undefined : parsed.live?.reachable === false ? 'app_not_running_or_unreachable' : 'verify_reported_not_ok'
+  };
 }
 
-function saveSyncState(fp) {
-  fs.mkdirSync(THEME_USER_DIR, { recursive: true });
-  fs.writeFileSync(
-    SYNC_STATE_FILE,
-    `${JSON.stringify({ appVersion: fp.version, appSig: fp.sig, lastSyncAt: Date.now(), repoUrl: SELF_REPO }, null, 2)}\n`,
-    'utf8'
-  );
-}
+/* -------------------------------------------------------------------------- */
+/* macOS LaunchAgent                                                          */
+/* -------------------------------------------------------------------------- */
 
 function enableMacAutoUpdateAgent() {
-  if (process.platform !== 'darwin') {
-    return { ok: false, reason: 'macos_launchd_only' };
+  if (process.platform !== 'darwin') return { ok: false, reason: 'macos_launchd_only' };
+  if (NO_LAUNCHD) return { ok: false, reason: 'launchd_disabled' };
+  const tmpRoot = fs.realpathSync(os.tmpdir());
+  if (fs.realpathSync(__dirname).startsWith(tmpRoot)) {
+    return { ok: false, reason: 'repo_in_temp_dir: clone to a permanent path (e.g. ~/Developer) before enabling auto-update' };
   }
   fs.mkdirSync(path.dirname(AUTOSYNC_PLIST), { recursive: true });
-  const scriptPath = path.join(__dirname, 'install.mjs');
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  const nodePath = stableNodePath();
   const envPath = Array.from(
-    new Set(['/opt/homebrew/bin', '/usr/local/bin', path.dirname(process.execPath), '/usr/bin', '/bin', '/usr/sbin', '/sbin'])
+    new Set(['/opt/homebrew/bin', '/usr/local/bin', path.dirname(nodePath), '/usr/bin', '/bin', '/usr/sbin', '/sbin'])
   ).join(':');
-
   const plistXml = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -421,14 +859,14 @@ function enableMacAutoUpdateAgent() {
   <string>${AUTOSYNC_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${process.execPath}</string>
-    <string>${scriptPath}</string>
+    <string>${xmlEscape(nodePath)}</string>
+    <string>${xmlEscape(path.join(__dirname, 'install.mjs'))}</string>
     <string>sync-upgrade</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>${envPath}</string>
+    <string>${xmlEscape(envPath)}</string>
   </dict>
   <key>WatchPaths</key>
   <array>
@@ -442,168 +880,277 @@ function enableMacAutoUpdateAgent() {
   <key>RunAtLoad</key>
   <false/>
   <key>StandardOutPath</key>
-  <string>${SYNC_LOG_FILE}</string>
+  <string>${xmlEscape(LAUNCHD_LOG_FILE)}</string>
   <key>StandardErrorPath</key>
-  <string>${SYNC_LOG_FILE}</string>
+  <string>${xmlEscape(LAUNCHD_LOG_FILE)}</string>
 </dict>
 </plist>
 `;
-  fs.writeFileSync(AUTOSYNC_PLIST, plistXml, 'utf8');
+  writeFileAtomic(AUTOSYNC_PLIST, plistXml);
   const uid = typeof process.getuid === 'function' ? process.getuid() : 501;
   try {
     execFileSync('launchctl', ['bootout', `gui/${uid}`, AUTOSYNC_PLIST], { stdio: 'ignore' });
   } catch {}
-  execFileSync('launchctl', ['bootstrap', `gui/${uid}`, AUTOSYNC_PLIST], { stdio: 'inherit' });
-  return { ok: true, label: AUTOSYNC_LABEL, plist: AUTOSYNC_PLIST };
+  try {
+    execFileSync('launchctl', ['bootstrap', `gui/${uid}`, AUTOSYNC_PLIST], { stdio: 'pipe' });
+  } catch (err) {
+    return { ok: false, reason: `launchctl_bootstrap_failed: ${String(err?.stderr || err?.message).trim()}`, plist: AUTOSYNC_PLIST };
+  }
+  return { ok: true, label: AUTOSYNC_LABEL, plist: AUTOSYNC_PLIST, node: nodePath };
 }
 
 function disableMacAutoUpdateAgent() {
-  if (process.platform !== 'darwin' || !fs.existsSync(AUTOSYNC_PLIST)) {
-    return { removed: false };
-  }
+  if (process.platform !== 'darwin' || !fs.existsSync(AUTOSYNC_PLIST)) return { removed: false };
   const uid = typeof process.getuid === 'function' ? process.getuid() : 501;
-  try {
-    execFileSync('launchctl', ['bootout', `gui/${uid}`, AUTOSYNC_PLIST], { stdio: 'ignore' });
-  } catch {}
+  if (!NO_LAUNCHD) {
+    try {
+      execFileSync('launchctl', ['bootout', `gui/${uid}`, AUTOSYNC_PLIST], { stdio: 'ignore' });
+    } catch {}
+  }
   fs.rmSync(AUTOSYNC_PLIST, { force: true });
   return { removed: true, label: AUTOSYNC_LABEL };
 }
 
-async function cmdDoctor() {
-  const fonts = checkFontsInstalled();
-  const fp = getAntigravityAppFingerprint();
-  const syncState = readJsonSafe(SYNC_STATE_FILE, null);
-  const pbtxt = readTextSafe(AGY_STATE_PBTXT) || '';
-  const cfgRaw = readTextSafe(AGY_CONFIG_JSON);
-  let verboseSteps = null;
-  try {
-    verboseSteps = cfgRaw ? JSON.parse(cfgRaw)?.userSettings?.verboseConversationSteps ?? null : null;
-  } catch {}
-  const agentsRaw = readTextSafe(AGENTS_MD) || '';
-  const report = {
-    platform: process.platform,
-    node: process.version,
-    antigravityAppVersion: fp.version,
-    baseThemePatchInstalled: fs.existsSync(path.join(THEME_PATCH_DIR, 'install.mjs')),
-    userLayerInstalled: (readTextSafe(path.join(THEME_USER_DIR, 'custom.js')) || '').includes('ag-claude-todo-card'),
-    autoUpdateWatcherInstalled: fs.existsSync(AUTOSYNC_PLIST),
-    lastSyncState: syncState,
-    fonts,
-    developerStepSkinUnlocked: pbtxt.includes('PRODUCT_SKIN_DEVELOPER'),
-    verboseConversationSteps: verboseSteps,
-    agentsRuleConfigured: agentsRaw.includes(RULE_BEGIN) || agentsRaw.includes(LEGACY_HEADING)
+function inspectAutoUpdateAgent() {
+  const xml = readTextSafe(AUTOSYNC_PLIST);
+  if (!xml) return { installed: false };
+  const m = xml.match(/<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]+)<\/string>\s*<string>([^<]+)<\/string>/);
+  const nodePath = m ? m[1].replace(/&amp;/g, '&') : null;
+  const scriptPath = m ? m[2].replace(/&amp;/g, '&') : null;
+  return {
+    installed: true,
+    nodePath,
+    nodeExists: Boolean(nodePath && fs.existsSync(nodePath)),
+    nodeVersionPinned: Boolean(nodePath && /\/Cellar\/|\/\.nvm\/versions\//.test(nodePath)),
+    scriptPath,
+    scriptExists: Boolean(scriptPath && fs.existsSync(scriptPath))
   };
-  console.log(JSON.stringify(report, null, 2));
 }
 
-async function cmdInstall({ enableAutoUpdate = true } = {}) {
-  const base = ensureOrUpgradeUpstreamThemePatch({ checkRemoteUpdate: false });
-  const fontsBefore = checkFontsInstalled();
-  let fontSync = null;
-  if (!fontsBefore.hasAnthropicSans) {
-    fontSync = syncFontsFromLocalClaudeApp();
-  }
-  const copiedFiles = installUserLayer(__dirname);
-  const cdpUnlock = await unlockStepsViaLiveCdp();
-  const fileUnlock = unlockStepsInConfigFiles();
-  const ruleStatus = injectAgentsMdRule(__dirname);
-  const verify = runUpstreamVerify();
-  const fp = getAntigravityAppFingerprint();
-  saveSyncState(fp);
-  const autoUpdate =
-    enableAutoUpdate && process.platform === 'darwin' ? enableMacAutoUpdateAgent() : { skipped: true };
+/* -------------------------------------------------------------------------- */
+/* Commands                                                                   */
+/* -------------------------------------------------------------------------- */
 
-  console.log(
-    JSON.stringify(
-      {
-        ok: true,
-        antigravityVersion: fp.version,
-        base,
-        fontSync,
-        copiedFiles,
-        stepStreamUnlock: { cdpUnlock, fileUnlock },
-        ruleStatus,
-        autoUpdate,
-        verifyOk: verify.ok
-      },
-      null,
-      2
-    )
+async function cmdDoctor() {
+  const state = readJsonSafe(STATE_FILE, null);
+  const pbtxt = readTextSafe(AGY_STATE_PBTXT) || '';
+  const cfg = readJsonSafe(AGY_CONFIG_JSON, null);
+  const agentsRaw = readTextSafe(AGENTS_MD) || '';
+  const incoming = fs.existsSync(INCOMING_DIR) ? fs.readdirSync(INCOMING_DIR) : [];
+  const agent = inspectAutoUpdateAgent();
+  const warnings = [];
+  if (agent.installed && !agent.nodeExists) warnings.push('auto-update LaunchAgent points to a missing node binary: run auto-update-on again');
+  if (agent.installed && !agent.scriptExists) warnings.push('auto-update LaunchAgent points to a missing install.mjs');
+  if (incoming.length) warnings.push(`template updates held back because of local edits: ${incoming.join(', ')} (see ${INCOMING_DIR})`);
+  if (!state && fs.existsSync(LEGACY_BACKUP_DIR)) warnings.push('v1 install detected: run `install` once to migrate the install state');
+  return finalize(
+    {
+      platform: process.platform,
+      node: process.version,
+      antigravityAppVersion: getAntigravityAppFingerprint().version,
+      baseThemePatchInstalled: fs.existsSync(path.join(THEME_PATCH_DIR, 'install.mjs')),
+      baseThemePatchVersion: readJsonSafe(path.join(THEME_PATCH_DIR, 'core', 'manifest.json'), {})?.version || null,
+      pinnedUpstreamRef: UPSTREAM_REF,
+      installState: state ? { installedAt: state.installedAt, options: state.options, files: Object.keys(state.files || {}) } : null,
+      userLayerInstalled: (readTextSafe(path.join(THEME_USER_DIR, 'custom.js')) || '').includes('ag-claude-todo-card'),
+      autoUpdate: agent,
+      lastSync: state?.sync || null,
+      fonts: checkFontsInstalled(),
+      developerStepSkinUnlocked: pbtxt.includes('PRODUCT_SKIN_DEVELOPER'),
+      verboseConversationSteps: cfg?.userSettings?.verboseConversationSteps ?? null,
+      agentsRuleConfigured: agentsRaw.includes(RULE_BEGIN) || agentsRaw.includes(LEGACY_HEADING)
+    },
+    { warnings }
   );
 }
 
-async function cmdSyncUpgrade({ force = false } = {}) {
-  const fp = getAntigravityAppFingerprint();
-  // 若 Antigravity.app 刚刚在 12 秒内完成包体写入，稍候片刻让新进程完成冷启动监听
-  if (fp.asarMtimeMs > 0 && Date.now() - fp.asarMtimeMs < 12000) {
-    await new Promise((r) => setTimeout(r, 4500));
+async function cmdInstall(flags) {
+  const critical = [];
+  const warnings = [];
+  const validation = validateSourceRoot();
+  if (!validation.ok) {
+    return finalize({ validation }, { critical: ['source validation failed, nothing deployed'] });
+  }
+  let base;
+  try {
+    base = ensureUpstreamCore({ upgrade: false });
+  } catch (err) {
+    return finalize({}, { critical: [`upstream core install failed: ${String(err?.message || err).split('\n')[0]}`] });
   }
 
-  const prev = readJsonSafe(SYNC_STATE_FILE, {});
-  const appChanged = prev?.appSig !== fp.sig;
-  const staleRemoteCheck = !prev?.lastSyncAt || Date.now() - Number(prev.lastSyncAt) > 20 * 3600 * 1000;
-  const shouldFetchRemote = force || appChanged || staleRemoteCheck;
+  const state = loadState() || newState();
+  if (flags.has('--no-step-unlock')) state.options.stepUnlock = false;
+  if (flags.has('--no-agents-rule')) state.options.agentsRule = false;
+  if (flags.has('--no-auto-update')) state.options.autoUpdate = false;
+  else if (flags.has('--auto-update')) state.options.autoUpdate = true;
+
+  const fontsBefore = checkFontsInstalled();
+  const fontSync = fontsBefore.hasAnthropicSans || NO_FONTS ? null : syncFontsFromLocalClaudeApp();
+
+  let layer;
+  try {
+    layer = installUserLayer(state, { overwriteLocal: flags.has('--overwrite-local') });
+  } catch (err) {
+    saveState(state);
+    return finalize({}, { critical: [`user layer deploy failed: ${err?.message || err}`] });
+  }
+  if (layer.conflicts.length) warnings.push(`local edits kept, new versions saved to ${INCOMING_DIR}: ${layer.conflicts.join(', ')} (use --overwrite-local to replace)`);
+  saveState(state);
+
+  let stepUnlock = { skipped: 'disabled_by_option' };
+  if (state.options.stepUnlock) {
+    stepUnlock = await applyStepUnlock(state);
+    if (!stepUnlock.live.ok && stepUnlock.live.appRunning !== false) warnings.push(`live step unlock: ${stepUnlock.live.reason}`);
+  }
+  const ruleStatus = state.options.agentsRule ? injectAgentsMdRule(state, { allowInsert: true }) : 'disabled_by_option';
+
+  const verify = runUpstreamVerify();
+  if (!verify.ok) warnings.push(`upstream verify: ${verify.reason}`);
+
+  const fp = getAntigravityAppFingerprint();
+  state.sync = Object.assign({}, state.sync, { appVersion: fp.version, appSig: fp.sig, lastAppliedAt: Date.now() });
+  saveState(state);
+
+  let autoUpdate = { skipped: true };
+  if (state.options.autoUpdate && process.platform === 'darwin') {
+    autoUpdate = enableMacAutoUpdateAgent();
+    if (!autoUpdate.ok && autoUpdate.reason !== 'launchd_disabled') warnings.push(`auto-update: ${autoUpdate.reason}`);
+  } else if (!state.options.autoUpdate) {
+    autoUpdate = disableMacAutoUpdateAgent();
+  }
+
+  return finalize(
+    { antigravityVersion: fp.version, base, fontSync, userLayer: layer, stepUnlock, ruleStatus, autoUpdate, verify },
+    { critical, warnings }
+  );
+}
+
+async function cmdSyncUpgrade(flags) {
+  const force = flags.has('--force');
+  const afterPull = flags.has('--after-pull');
+  const state = loadState();
+  if (!state) return finalize({ noop: true, reason: 'not_installed' });
+
+  const fp = getAntigravityAppFingerprint();
+  if (fp.changedAtMs > 0 && Date.now() - fp.changedAtMs < 12000) {
+    await new Promise((r) => setTimeout(r, 4500)); // let a freshly updated app finish its cold start
+  }
+  const warnings = [];
+  const appChanged = state.sync?.appSig !== fp.sig;
+  const now = Date.now();
 
   let selfPull = { skipped: true };
-  let baseSync = { skipped: true };
-  if (shouldFetchRemote) {
+  let core = { skipped: true };
+  if (!afterPull && !NO_NETWORK && shouldCheckRemote(state.sync, { now, force, appChanged })) {
+    state.sync = Object.assign({}, state.sync, { lastRemoteCheckAt: now });
     selfPull = pullSelfRepoIfGit();
-    baseSync = ensureOrUpgradeUpstreamThemePatch({ checkRemoteUpdate: true });
+    if (selfPull.error) warnings.push(`self pull: ${selfPull.error}`);
+    if (selfPull.updated) {
+      const v = validateSourceRoot();
+      if (!v.ok) {
+        saveState(state);
+        return finalize({ selfPull, validation: v }, { critical: ['pulled code failed validation; live files left untouched'] });
+      }
+      state.sync.lastRemoteCheckOk = true;
+      saveState(state);
+      /* re-exec so the freshly pulled installer logic applies to this run */
+      const args = [path.join(__dirname, 'install.mjs'), 'sync-upgrade', '--after-pull', ...[...flags].filter((f) => f !== '--after-pull')];
+      try {
+        execFileSync(process.execPath, args, { stdio: 'inherit', timeout: 180000 });
+      } catch (err) {
+        process.exitCode = typeof err?.status === 'number' ? err.status : 1;
+      }
+      return null;
+    }
+    core = ensureUpstreamCore({ upgrade: true });
+    if (core.error) warnings.push(`upstream core: ${core.error}`);
+    state.sync.lastRemoteCheckOk = !selfPull.error && !core.error;
   }
 
-  const copiedFiles = installUserLayer(__dirname);
-  const cdpUnlock = await unlockStepsViaLiveCdp();
-  const fileUnlock = unlockStepsInConfigFiles();
-  const ruleStatus = injectAgentsMdRule(__dirname);
+  const validation = validateSourceRoot();
+  if (!validation.ok) {
+    saveState(state);
+    return finalize({ validation }, { critical: ['source validation failed; live files left untouched'] });
+  }
+  const layer = installUserLayer(state, { overwriteLocal: flags.has('--overwrite-local') });
+  if (layer.conflicts.length) warnings.push(`local edits kept, new versions in ${INCOMING_DIR}: ${layer.conflicts.join(', ')}`);
+
+  /* Only re-assert step settings after an app update (which may reset them); a user's later choice is respected otherwise. */
+  let stepUnlock = { skipped: appChanged ? 'disabled_by_option' : 'app_unchanged' };
+  if (appChanged && state.options.stepUnlock) stepUnlock = await applyStepUnlock(state);
+  const ruleStatus = state.options.agentsRule ? injectAgentsMdRule(state, { allowInsert: false }) : 'disabled_by_option';
 
   let verify = { skipped: true };
-  if (force || appChanged || selfPull.updated || baseSync.upgraded || copiedFiles.length > 0 || fileUnlock.length > 0) {
+  const changed = layer.created.length + layer.updated.length + layer.merged.length > 0;
+  if (force || appChanged || core.upgraded || changed) {
     verify = runUpstreamVerify();
+    if (!verify.ok) warnings.push(`upstream verify: ${verify.reason}`);
   }
 
-  saveSyncState(fp);
-  const summary = `sync-upgrade ok | agy=${fp.version} | appChanged=${appChanged} | selfUpdated=${Boolean(selfPull.updated)} | coreUpgraded=${Boolean(baseSync.upgraded)} | copied=${copiedFiles.length}`;
+  state.sync = Object.assign({}, state.sync, { appVersion: fp.version, appSig: fp.sig, lastAppliedAt: now });
+  saveState(state);
+  const summary = `sync-upgrade | agy=${fp.version} | appChanged=${appChanged} | remoteChecked=${!selfPull.skipped} | coreUpgraded=${Boolean(core.upgraded)} | updated=${layer.updated.length + layer.merged.length} | conflicts=${layer.conflicts.length}`;
   appendSyncLog(summary);
-  console.log(JSON.stringify({ ok: true, summary, selfPull, baseSync, copiedFiles, cdpUnlock, fileUnlock, ruleStatus, verifyOk: verify.ok ?? null }, null, 2));
+  return finalize({ summary, selfPull, core, userLayer: layer, stepUnlock, ruleStatus, verify }, { warnings });
 }
 
 async function cmdUninstall() {
-  const autoUpdateRemoved = disableMacAutoUpdateAgent();
-  const restored = [];
-  if (fs.existsSync(BACKUP_DIR)) {
-    for (const f of USER_LAYER_FILES) {
-      const bak = path.join(BACKUP_DIR, f);
-      if (fs.existsSync(bak)) {
-        fs.copyFileSync(bak, path.join(THEME_USER_DIR, f));
-        restored.push(f);
-      }
-    }
-    fs.rmSync(BACKUP_DIR, { recursive: true, force: true });
-  } else {
-    fs.writeFileSync(path.join(THEME_USER_DIR, 'custom.css'), '/* user/custom.css */\n', 'utf8');
-    fs.writeFileSync(path.join(THEME_USER_DIR, 'custom.js'), '/* user/custom.js */\n', 'utf8');
+  const state = loadState();
+  if (!state) {
+    const autoUpdateRemoved = disableMacAutoUpdateAgent();
+    return finalize({ noop: true, reason: 'not_installed', autoUpdateRemoved });
   }
-  fs.rmSync(SYNC_STATE_FILE, { force: true });
+  const warnings = [];
+  const autoUpdateRemoved = disableMacAutoUpdateAgent();
+  const settings = await revertStepUnlock(state);
+  if (settings.live && !settings.live.ok && settings.live.appRunning !== false) warnings.push(`live settings revert: ${settings.live.reason}`);
+  const files = restoreUserLayer(state);
+  if (files.savedLocalEdits.length) warnings.push(`your post-install edits were saved: ${files.savedLocalEdits.join(', ')}`);
   const ruleRemoved = removeAgentsMdRule();
+  fs.rmSync(STATE_DIR, { recursive: true, force: true });
+  fs.rmSync(LEGACY_SYNC_LOG_FILE, { force: true });
   const verify = runUpstreamVerify();
-  console.log(JSON.stringify({ ok: true, autoUpdateRemoved, restored, ruleRemoved, verifyOk: verify.ok }, null, 2));
+  return finalize({ autoUpdateRemoved, settings, files, ruleRemoved, verify }, { warnings });
 }
 
-const sub = process.argv[2] || 'doctor';
-const flags = new Set(process.argv.slice(3));
+async function main(argv) {
+  const sub = argv[0] || 'doctor';
+  const flags = new Set(argv.slice(1));
+  if (sub === 'install') return cmdInstall(flags);
+  if (sub === 'sync-upgrade') return cmdSyncUpgrade(flags);
+  if (sub === 'auto-update-on') {
+    const state = loadState();
+    if (state) {
+      state.options.autoUpdate = true;
+      saveState(state);
+    }
+    return console.log(JSON.stringify(enableMacAutoUpdateAgent(), null, 2));
+  }
+  if (sub === 'auto-update-off') {
+    const state = loadState();
+    if (state) {
+      state.options.autoUpdate = false;
+      saveState(state);
+    }
+    return console.log(JSON.stringify(disableMacAutoUpdateAgent(), null, 2));
+  }
+  if (sub === 'uninstall') return cmdUninstall();
+  if (sub === 'sync-fonts') return console.log(JSON.stringify(syncFontsFromLocalClaudeApp(), null, 2));
+  return cmdDoctor();
+}
 
-if (sub === 'install') {
-  await cmdInstall({ enableAutoUpdate: !flags.has('--no-auto-update') });
-} else if (sub === 'sync-upgrade') {
-  await cmdSyncUpgrade({ force: flags.has('--force') });
-} else if (sub === 'auto-update-on') {
-  console.log(JSON.stringify(enableMacAutoUpdateAgent(), null, 2));
-} else if (sub === 'auto-update-off') {
-  console.log(JSON.stringify(disableMacAutoUpdateAgent(), null, 2));
-} else if (sub === 'uninstall') {
-  await cmdUninstall();
-} else if (sub === 'sync-fonts') {
-  console.log(JSON.stringify(syncFontsFromLocalClaudeApp(), null, 2));
-} else {
-  await cmdDoctor();
+const isMain = (() => {
+  try {
+    return Boolean(process.argv[1]) && fs.realpathSync(process.argv[1]) === fs.realpathSync(__filename);
+  } catch {
+    return false;
+  }
+})();
+
+if (isMain) {
+  try {
+    await main(process.argv.slice(2));
+  } catch (err) {
+    finalize({}, { critical: [String(err?.stack || err)] });
+  }
 }

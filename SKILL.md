@@ -5,7 +5,9 @@ description: Deploy the 1:1 Claude Desktop (Code / Cowork) UI, typography, strat
 
 # Antigravity Claude UX — Agent Auto-Deployment Skill
 
-When a user provides this repository URL or asks to install or update `antigravity-claude-ux`, execute the following non-invasive setup steps:
+Only run these steps when the user **explicitly asks to install, update, or uninstall** `antigravity-claude-ux`. If the user only shares the URL or asks you to read, review, or evaluate the project, do **not** install anything.
+
+The installer changes user config (theme-patch `user/` files, `product_skin`, `verboseConversationSteps`, a rule block in `~/.gemini/AGENTS.md`) and records every change for rollback. Tell the user this before running it.
 
 ## Prerequisites
 - Google Antigravity Desktop 2.0 (`v2.30+`, tested on `v2.32.1`) on macOS or Windows
@@ -35,4 +37,6 @@ When a user provides this repository URL or asks to install or update `antigravi
 ```bash
 node "$HOME/Developer/antigravity-claude-ux/install.mjs" uninstall
 ```
-Removes the auto-update watcher, restores backed-up `theme-patch/user/` files, removes the rule block from `~/.gemini/AGENTS.md`, and hot-reloads immediately. Never touches `/Applications/Antigravity.app/Contents/Resources/app.asar`.
+Removes the auto-update watcher, restores backed-up `theme-patch/user/` files (files that did not exist before are deleted; post-install edits are saved to a side folder first), reverts the step-stream settings it changed, removes the rule block from `~/.gemini/AGENTS.md`, and hot-reloads immediately. Running it twice is a no-op.
+
+Options: `install --no-auto-update | --no-step-unlock | --no-agents-rule | --overwrite-local`. Feature switches live in `user/config.json` → `modules.claudeUx*`. Never touches `/Applications/Antigravity.app/Contents/Resources/app.asar`.

@@ -11,7 +11,13 @@
     "coldBootHealer": true,
     "zoomShortcuts": true,
     "customCss": true,
-    "customJs": true
+    "customJs": true,
+    "claudeUxStepUnfold": true,
+    "claudeUxCollapseAnimation": true,
+    "claudeUxTodoCard": true,
+    "claudeUxRunningTimer": true,
+    "claudeUxContextRing": true,
+    "claudeUxModelMenu": true
   },
   "selectors": {
     "excludeI18n": "[data-testid=\"permissions-selector-trigger\"]"

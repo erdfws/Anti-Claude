@@ -362,6 +362,45 @@
     return Boolean(items && items.some((it) => it.status === 'in_progress'));
   }
 
+  /*
+   * Per-turn checklist memory. Antigravity virtualises the step stream: once a mid-turn narration scrolls out
+   * of its render window the node (and its checklist) is unmounted, leaving only the turn's first list and the
+   * final summary in the DOM. Every checklist version seen while mounted is remembered here, keyed by content
+   * signature (so a version re-mounted by scrolling up keeps its original order). The newest version is the one
+   * with the most progress; ties go to the one seen last.
+   */
+  const turnTodoMemory = new WeakMap();
+  let todoSeenSeq = 0;
+  function todoSignature(items) {
+    return items.map((it) => `${it.status.charAt(0)}:${normalizeTodoText(it.html)}`).join('|');
+  }
+  function todoProgress(items) {
+    let score = 0;
+    for (const it of items) score += it.status === 'completed' ? 2 : it.status === 'in_progress' ? 1 : 0;
+    return score;
+  }
+  function rememberTurnTodo(turnEl, items) {
+    if (!turnEl || !items) return;
+    let mem = turnTodoMemory.get(turnEl);
+    if (!mem) {
+      mem = new Map();
+      turnTodoMemory.set(turnEl, mem);
+    }
+    const sig = todoSignature(items);
+    if (!mem.has(sig)) mem.set(sig, { seq: ++todoSeenSeq, items, progress: todoProgress(items) });
+  }
+  function latestRememberedTodo(turnEl, baseItems) {
+    const mem = turnEl && turnTodoMemory.get(turnEl);
+    if (!mem || !baseItems) return null;
+    let best = null;
+    for (const rec of mem.values()) {
+      if (!isChecklistEvolution(baseItems, rec.items)) continue;
+      if (!best || rec.progress > best.progress || (rec.progress === best.progress && rec.seq > best.seq)) best = rec;
+    }
+    if (!best || todoProgress(baseItems) > best.progress) return null;
+    return best.items;
+  }
+
   /**
    * Only *execution-progress* checklists are taken over:
    *  - a cluster starts with a list containing an active `[/]` item (the marker the AGENTS.md rule mandates);
@@ -388,6 +427,7 @@
           byPane.set(key, group);
         }
         group.entries.push({ ul, items, turnEl });
+        rememberTurnTodo(turnEl, items);
       }
 
       for (const group of byPane.values()) {
@@ -427,6 +467,9 @@
         for (let i = 0; i < clusters.length; i++) {
           const cluster = clusters[i];
           for (const ul of cluster.lists) touched.add(ul);
+          /* Antigravity unmounts off-screen steps: the newest mid-turn checklist may no longer be in the DOM. */
+          const remembered = latestRememberedTodo(cluster.lastTurnEl, cluster.items);
+          if (remembered) cluster.items = remembered;
           const isDockedLiveCluster =
             paneLive && i === clusters.length - 1 && Boolean(cluster.lastTurnEl && cluster.lastTurnEl === latestPaneTurn);
           const mountedDock = isDockedLiveCluster ? renderLiveDockedTodoCard(pane, cluster.items) : null;

@@ -214,3 +214,34 @@ test('feature switch off: model menu is not intercepted, checklists untouched', 
   assert.equal(h.doc.querySelectorAll('.ag-claude-todo-card').length, 0);
   h.close();
 });
+
+test('virtualised step stream: card keeps the newest progress after the mid-turn list is unmounted', { skip }, async () => {
+  const h = mount(pane([ul(li('阶段一 读代码', 'in_progress'), li('阶段二 修复'), li('阶段三 测试'))], { generating: true }));
+  const statuses = () => Array.from(h.doc.querySelectorAll('[data-ag-todo-dock] .ag-claude-todo-row')).map((r) => r.getAttribute('data-status'));
+  const settle = async () => {
+    await h.microtasks();
+    await new Promise((r) => setTimeout(r, 100));
+    h.flushFrames();
+  };
+  assert.deepEqual(statuses(), ['in_progress', 'pending', 'pending']);
+
+  /* a later step streams in with an updated checklist ... */
+  const turn = h.doc.querySelector('[data-testid="agent-response"]');
+  const step = h.doc.createElement('div');
+  step.innerHTML = `<div data-testid="planner-response-text">${ul(li('阶段一 读代码', 'completed'), li('阶段二 修复', 'completed'), li('阶段三 测试', 'in_progress'))}</div>`;
+  turn.appendChild(step);
+  await settle();
+  assert.deepEqual(statuses(), ['completed', 'completed', 'in_progress']);
+
+  /* ... then scrolls out of the render window and is unmounted by the app */
+  step.remove();
+  await settle();
+  assert.deepEqual(statuses(), ['completed', 'completed', 'in_progress'], 'must not fall back to the first list');
+
+  /* scrolling back up re-mounts the first list: progress must not regress either */
+  turn.appendChild(h.doc.createElement('p'));
+  await settle();
+  assert.deepEqual(statuses(), ['completed', 'completed', 'in_progress']);
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});

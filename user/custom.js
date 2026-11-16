@@ -436,30 +436,53 @@
     flush();
     return lists;
   }
+  /*
+   * The turn container's props hold the complete, ordered step list (independent of what is mounted).
+   * Only the visible response text is used; `thinking` is model reasoning / summaries and is ignored.
+   * Antigravity drops mid-turn narrations that carry a multi-line checklist, so mid-turn progress is
+   * reported as a one-line marker `〔进度 N/M〕` (or `[progress N/M]`), which survives.
+   */
+  const PROGRESS_RE = /〔\s*进度\s*(\d+)\s*\/\s*(\d+)\s*〕|\[\s*progress\s*(\d+)\s*\/\s*(\d+)\s*\]/gi;
+  const turnProgressMarker = new WeakMap();
+  function turnStepsOf(turnEl) {
+    const fk = Object.keys(turnEl).find((k) => k.startsWith('__reactFiber$'));
+    let f = fk ? turnEl[fk] : null;
+    for (let i = 0; i < 8 && f; i++, f = f.return) {
+      const p = f.memoizedProps;
+      if (p && p.container && Array.isArray(p.container.steps)) return p.container.steps;
+    }
+    return null;
+  }
   function harvestStepChecklists(turnEl) {
     if (!turnEl) return;
-    for (const btn of turnEl.querySelectorAll('button[data-testid="tool-group-collapsible"]')) {
-      const fk = Object.keys(btn).find((k) => k.startsWith('__reactFiber$'));
-      let f = fk ? btn[fk] : null;
-      let steps = null;
-      for (let i = 0; i < 6 && f; i++, f = f.return) {
-        const p = f.memoizedProps;
-        if (p && Array.isArray(p.steps)) {
-          steps = p.steps;
-          break;
-        }
-      }
-      if (!steps) continue;
-      for (const s of steps) {
-        const v = s && s.step && s.step.case === 'plannerResponse' ? s.step.value : null;
-        if (!v || typeof v !== 'object') continue;
-        const text = `${v.modifiedResponse || v.response || ''}\n${v.thinking || ''}`;
-        if (stepTextSeen.get(v) === text.length) continue;
-        stepTextSeen.set(v, text.length);
-        if (text.indexOf('[') === -1) continue;
-        for (const items of extractTaskLists(text)) rememberTurnTodo(turnEl, items);
+    const steps = turnStepsOf(turnEl);
+    if (!steps) return;
+    for (const s of steps) {
+      const v = s && s.step && s.step.case === 'plannerResponse' ? s.step.value : null;
+      if (!v || typeof v !== 'object') continue;
+      const text = v.modifiedResponse || v.response || '';
+      if (!text || stepTextSeen.get(v) === text.length) continue;
+      stepTextSeen.set(v, text.length);
+      for (const items of extractTaskLists(text)) rememberTurnTodo(turnEl, items);
+      PROGRESS_RE.lastIndex = 0;
+      let m;
+      let last = null;
+      while ((m = PROGRESS_RE.exec(text))) last = m;
+      if (last) {
+        const n = Number(last[1] || last[3]);
+        const total = Number(last[2] || last[4]);
+        if (n >= 1 && total >= n && total <= 15) turnProgressMarker.set(turnEl, { n, total });
       }
     }
+  }
+  function applyProgressMarker(turnEl, items) {
+    const mk = turnEl && turnProgressMarker.get(turnEl);
+    if (!mk || !items || mk.total !== items.length) return items;
+    const next = items.map((it, i) => ({
+      status: i < mk.n - 1 ? 'completed' : i === mk.n - 1 ? 'in_progress' : 'pending',
+      html: it.html
+    }));
+    return todoProgress(next) > todoProgress(items) ? next : items;
   }
 
   /**
@@ -532,6 +555,7 @@
           /* Antigravity unmounts off-screen steps: the newest mid-turn checklist may no longer be in the DOM. */
           const remembered = latestRememberedTodo(cluster.lastTurnEl, cluster.items);
           if (remembered) cluster.items = remembered;
+          cluster.items = applyProgressMarker(cluster.lastTurnEl, cluster.items);
           const isDockedLiveCluster =
             paneLive && i === clusters.length - 1 && Boolean(cluster.lastTurnEl && cluster.lastTurnEl === latestPaneTurn);
           const mountedDock = isDockedLiveCluster ? renderLiveDockedTodoCard(pane, cluster.items) : null;

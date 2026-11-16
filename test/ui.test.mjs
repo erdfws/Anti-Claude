@@ -246,26 +246,53 @@ test('virtualised step stream: card keeps the newest progress after the mid-turn
   h.close();
 });
 
-test('mid-turn checklist stored only in step data (thinking field, never rendered) still advances the card', { skip }, async () => {
-  const h = mount(pane([ul(li('切换守护', 'in_progress'), li('真机验证'), li('收尾说明'))], { generating: true }));
-  const statuses = () => Array.from(h.doc.querySelectorAll('[data-ag-todo-dock] .ag-claude-todo-row')).map((r) => r.getAttribute('data-status'));
-  assert.deepEqual(statuses(), ['in_progress', 'pending', 'pending']);
-
+function attachTurnSteps(h, texts) {
   const turn = h.doc.querySelector('[data-testid="agent-response"]');
-  const btn = h.doc.createElement('button');
-  btn.setAttribute('data-testid', 'tool-group-collapsible');
-  btn.setAttribute('aria-expanded', 'false');
-  btn.textContent = '已运行 命令';
-  const steps = [
-    { step: { case: 'generic', value: {} } },
-    { step: { case: 'plannerResponse', value: { response: '', thinking: '守护已切换。\n\n- [x] 切换守护\n- [/] 真机验证\n- [ ] 收尾说明\n\n接着验证。' } } }
-  ];
-  btn.__reactFiber$t = { memoizedProps: {}, return: { memoizedProps: {}, return: { memoizedProps: { steps, isRunning: true } } } };
-  turn.appendChild(btn);
+  const steps = texts.map((t) => ({ step: { case: 'plannerResponse', value: { response: t, thinking: '- [x] 阶段一 (thinking must be ignored)' } } }));
+  turn.__reactFiber$t = { memoizedProps: {}, return: { memoizedProps: { container: { steps } } } };
+  return { turn, steps };
+}
+
+async function settle(h) {
   await h.microtasks();
   await new Promise((r) => setTimeout(r, 100));
   h.flushFrames();
-  assert.deepEqual(statuses(), ['completed', 'in_progress', 'pending']);
+}
+
+const dockStatuses = (h) => Array.from(h.doc.querySelectorAll('[data-ag-todo-dock] .ag-claude-todo-row')).map((r) => r.getAttribute('data-status'));
+
+test('one-line 〔进度 N/M〕 marker in turn step data advances the live card', { skip }, async () => {
+  const h = mount(pane([ul(li('切换守护', 'in_progress'), li('真机验证'), li('收尾说明'))], { generating: true }));
+  assert.deepEqual(dockStatuses(h), ['in_progress', 'pending', 'pending']);
+  const { turn, steps } = attachTurnSteps(h, ['开场说明', '守护已切换。〔进度 2/3〕真机验证']);
+  turn.appendChild(h.doc.createElement('p'));
+  await settle(h);
+  assert.deepEqual(dockStatuses(h), ['completed', 'in_progress', 'pending']);
+
+  steps.push({ step: { case: 'plannerResponse', value: { response: '〔进度 3/3〕收尾' } } });
+  turn.appendChild(h.doc.createElement('p'));
+  await settle(h);
+  assert.deepEqual(dockStatuses(h), ['completed', 'completed', 'in_progress']);
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});
+
+test('full checklist in an unrendered step response is used; thinking text is ignored', { skip }, async () => {
+  const h = mount(pane([ul(li('阶段一', 'in_progress'), li('阶段二'), li('阶段三'))], { generating: true }));
+  const { turn } = attachTurnSteps(h, ['进展：\n- [x] 阶段一\n- [/] 阶段二\n- [ ] 阶段三']);
+  turn.appendChild(h.doc.createElement('p'));
+  await settle(h);
+  assert.deepEqual(dockStatuses(h), ['completed', 'in_progress', 'pending']);
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});
+
+test('marker with a mismatched total is ignored', { skip }, async () => {
+  const h = mount(pane([ul(li('阶段一', 'in_progress'), li('阶段二'), li('阶段三'))], { generating: true }));
+  const { turn } = attachTurnSteps(h, ['〔进度 2/5〕别的任务']);
+  turn.appendChild(h.doc.createElement('p'));
+  await settle(h);
+  assert.deepEqual(dockStatuses(h), ['in_progress', 'pending', 'pending']);
   h.cleanups.forEach((fn) => fn());
   h.close();
 });

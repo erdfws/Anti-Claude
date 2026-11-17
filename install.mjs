@@ -54,10 +54,13 @@ const LEGACY_SYNC_LOG_FILE = path.join(THEME_USER_DIR, 'auto-sync.log');
 
 const AUTOSYNC_LABEL = 'com.antigravity.claude-ux.autosync';
 const AUTOSYNC_PLIST = path.join(HOME, 'Library', 'LaunchAgents', `${AUTOSYNC_LABEL}.plist`);
+const THEME_DAEMON_LABEL = 'com.antigravity.theme';
+const DAEMON_WRAPPER_FILE = path.join(AGY_DIR, 'scripts', 'antigravity-font-daemon.mjs');
+const AG2_SYNC_SCRIPT = path.join(AGY_DIR, 'scripts', 'sync-antigravity-2.mjs');
 
 const UPSTREAM_REPO = 'https://github.com/Anarcadia/chuanban-antigravity-theme-patch.git';
-/* Verified upstream commit. Bump deliberately after testing; override with CLAUDE_UX_UPSTREAM_REF=HEAD at your own risk. */
-const UPSTREAM_REF = process.env.CLAUDE_UX_UPSTREAM_REF || '6a263b50cb575b22059f4429a9ba9625c0c540df';
+/* Verified upstream commit (v5.4.2). Bump deliberately after testing; override with CLAUDE_UX_UPSTREAM_REF=HEAD at your own risk. */
+const UPSTREAM_REF = process.env.CLAUDE_UX_UPSTREAM_REF || '6b3783d2a5104e863084adfffea1d61f95838ead';
 const SELF_REPO = 'https://github.com/hongqi7/antigravity-claude-ux.git';
 const RULE_BEGIN = '<!-- BEGIN antigravity-claude-ux -->';
 const RULE_END = '<!-- END antigravity-claude-ux -->';
@@ -835,8 +838,152 @@ function runUpstreamVerify() {
 }
 
 /* -------------------------------------------------------------------------- */
-/* macOS LaunchAgent                                                          */
+/* macOS LaunchAgent & Antigravity 2.33+ CDP Bootstrap Wrapper                */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * Antigravity 2.33.0+ stopped appending `--remote-debugging-port=0` by default in C++,
+ * and modifying `/Applications/Antigravity.app` breaks Google's Developer ID signature
+ * (Gatekeeper + Squirrel.Mac auto-updates). Instead, wrap `antigravity-font-daemon.mjs`
+ * with a zero-overhead check: when `DevToolsActivePort` is missing and a freshly launched
+ * (`<= 25s` old) `/Applications/Antigravity.app` main process is running without
+ * `--remote-debugging-port`, gracefully relaunch it with `--args --remote-debugging-port=0`.
+ * Long-running sessions (`> 25s`) are never interrupted.
+ */
+function ensureMacCdpBootstrapWrapper() {
+  if (process.platform !== 'darwin') return { skipped: 'not_darwin' };
+  const coreDaemonPath = path.join(THEME_PATCH_DIR, 'core', 'daemon.mjs');
+  if (!fs.existsSync(coreDaemonPath)) return { skipped: 'core_daemon_missing' };
+  const coreUrl = `file://${coreDaemonPath}`;
+  const wrapperSrc = `#!/usr/bin/env node
+// Auto-generated wrapper -> ${coreDaemonPath} (with Antigravity 2.33.0+ CDP bootstrap)
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFile } from 'node:child_process';
+
+if (process.platform === 'darwin' && !process.argv.includes('--once')) {
+  const portFile = path.join(os.homedir(), 'Library', 'Application Support', 'Antigravity', 'DevToolsActivePort');
+  const mainBin = '/Applications/Antigravity.app/Contents/MacOS/Antigravity';
+  let busy = false;
+  let lastRelaunchAt = 0;
+
+  const parseEtimeSec = (raw) => {
+    const s = String(raw || '').trim();
+    let days = 0;
+    let rest = s;
+    if (s.includes('-')) {
+      const [d, r] = s.split('-', 2);
+      days = parseInt(d, 10) || 0;
+      rest = r;
+    }
+    const parts = rest.split(':').map((x) => parseInt(x, 10) || 0);
+    if (parts.length === 3) return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length === 2) return days * 86400 + parts[0] * 60 + parts[1];
+    return Infinity;
+  };
+
+  const checkFreshLaunch = () => {
+    if (busy || fs.existsSync(portFile) || Date.now() - lastRelaunchAt < 25000) return;
+    busy = true;
+    execFile('ps', ['-axo', 'pid=,etime=,command='], { timeout: 2500 }, (err, stdout) => {
+      if (err || !stdout) {
+        busy = false;
+        return;
+      }
+      let targetPid = 0;
+      let targetAge = Infinity;
+      for (const line of String(stdout).split('\\n')) {
+        const m = line.trim().match(/^(\\d+)\\s+(\\S+)\\s+(.+)$/);
+        if (!m) continue;
+        const pid = Number(m[1]);
+        const age = parseEtimeSec(m[2]);
+        const cmd = m[3];
+        if ((cmd === mainBin || cmd.startsWith(mainBin + ' ')) && !cmd.includes('--remote-debugging-port')) {
+          targetPid = pid;
+          targetAge = age;
+          break;
+        }
+      }
+      if (!targetPid || targetAge > 25) {
+        busy = false;
+        return;
+      }
+      lastRelaunchAt = Date.now();
+      console.log(\`[CDP-Bootstrap] Relaunching fresh Antigravity (PID \${targetPid}, age=\${targetAge}s) with --remote-debugging-port=0\`);
+      try {
+        process.kill(targetPid, 'SIGTERM');
+      } catch {
+        busy = false;
+        return;
+      }
+      const deadline = Date.now() + 4500;
+      const waitExit = () => {
+        let alive = false;
+        try {
+          process.kill(targetPid, 0);
+          alive = true;
+        } catch {}
+        if (alive && Date.now() < deadline) {
+          setTimeout(waitExit, 120);
+          return;
+        }
+        execFile('/usr/bin/open', ['-a', '/Applications/Antigravity.app', '--args', '--remote-debugging-port=0'], () => {
+          busy = false;
+        });
+      };
+      setTimeout(waitExit, 150);
+    });
+  };
+
+  setInterval(checkFreshLaunch, 1200).unref();
+  checkFreshLaunch();
+}
+
+await import(${JSON.stringify(coreUrl)});
+`;
+  const prev = readTextSafe(DAEMON_WRAPPER_FILE);
+  if (prev === wrapperSrc) return { ok: true, updated: false };
+  writeFileAtomic(DAEMON_WRAPPER_FILE, wrapperSrc);
+  try {
+    fs.chmodSync(DAEMON_WRAPPER_FILE, 0o755);
+  } catch {}
+  if (!NO_LAUNCHD) {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 501;
+    try {
+      execFileSync('launchctl', ['kickstart', '-k', `gui/${uid}/${THEME_DAEMON_LABEL}`], { stdio: 'ignore' });
+    } catch {}
+  }
+  return { ok: true, updated: true };
+}
+
+function restorePlainDaemonWrapper() {
+  if (process.platform !== 'darwin') return { skipped: 'not_darwin' };
+  const coreDaemonPath = path.join(THEME_PATCH_DIR, 'core', 'daemon.mjs');
+  if (!fs.existsSync(DAEMON_WRAPPER_FILE) || !fs.existsSync(coreDaemonPath)) return { restored: false };
+  const plain = `#!/usr/bin/env node\n// Auto-generated wrapper -> ${coreDaemonPath}\nawait import(${JSON.stringify(`file://${coreDaemonPath}`)});\n`;
+  writeFileAtomic(DAEMON_WRAPPER_FILE, plain);
+  if (!NO_LAUNCHD) {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 501;
+    try {
+      execFileSync('launchctl', ['kickstart', '-k', `gui/${uid}/${THEME_DAEMON_LABEL}`], { stdio: 'ignore' });
+    } catch {}
+  }
+  return { restored: true };
+}
+
+function syncAntigravity2IfInstalled() {
+  if (process.platform !== 'darwin' || NO_LAUNCHD) return { skipped: true };
+  if (!fs.existsSync('/Applications/Antigravity 2.app') || !fs.existsSync(AG2_SYNC_SCRIPT)) {
+    return { skipped: 'not_present' };
+  }
+  try {
+    execFileSync(process.execPath, [AG2_SYNC_SCRIPT], { stdio: 'pipe', timeout: 90000 });
+    return { ok: true, synced: true };
+  } catch (err) {
+    return { ok: false, error: String(err?.message || err).split('\n')[0] };
+  }
+}
 
 function enableMacAutoUpdateAgent() {
   if (process.platform !== 'darwin') return { ok: false, reason: 'macos_launchd_only' };
@@ -1003,6 +1150,7 @@ async function cmdInstall(flags) {
     if (!stepUnlock.live.ok && stepUnlock.live.appRunning !== false) warnings.push(`live step unlock: ${stepUnlock.live.reason}`);
   }
   const ruleStatus = state.options.agentsRule ? injectAgentsMdRule(state, { allowInsert: true }) : 'disabled_by_option';
+  const cdpBootstrap = ensureMacCdpBootstrapWrapper();
 
   const verify = runUpstreamVerify();
   if (!verify.ok) warnings.push(`upstream verify: ${verify.reason}`);
@@ -1020,7 +1168,7 @@ async function cmdInstall(flags) {
   }
 
   return finalize(
-    { antigravityVersion: fp.version, base, fontSync, userLayer: layer, stepUnlock, ruleStatus, autoUpdate, verify },
+    { antigravityVersion: fp.version, base, fontSync, userLayer: layer, stepUnlock, ruleStatus, cdpBootstrap, autoUpdate, verify },
     { critical, warnings }
   );
 }
@@ -1079,6 +1227,9 @@ async function cmdSyncUpgrade(flags) {
   let stepUnlock = { skipped: appChanged ? 'disabled_by_option' : 'app_unchanged' };
   if (appChanged && state.options.stepUnlock) stepUnlock = await applyStepUnlock(state);
   const ruleStatus = state.options.agentsRule ? injectAgentsMdRule(state, { allowInsert: false }) : 'disabled_by_option';
+  const cdpBootstrap = ensureMacCdpBootstrapWrapper();
+  const ag2Sync = appChanged ? syncAntigravity2IfInstalled() : { skipped: 'app_unchanged' };
+  if (ag2Sync.error) warnings.push(`antigravity-2 sync: ${ag2Sync.error}`);
 
   let verify = { skipped: true };
   const changed = layer.created.length + layer.updated.length + layer.merged.length > 0;
@@ -1091,17 +1242,19 @@ async function cmdSyncUpgrade(flags) {
   saveState(state);
   const summary = `sync-upgrade | agy=${fp.version} | appChanged=${appChanged} | remoteChecked=${!selfPull.skipped} | coreUpgraded=${Boolean(core.upgraded)} | updated=${layer.updated.length + layer.merged.length} | conflicts=${layer.conflicts.length}`;
   appendSyncLog(summary);
-  return finalize({ summary, selfPull, core, userLayer: layer, stepUnlock, ruleStatus, verify }, { warnings });
+  return finalize({ summary, selfPull, core, userLayer: layer, stepUnlock, ruleStatus, cdpBootstrap, ag2Sync, verify }, { warnings });
 }
 
 async function cmdUninstall() {
   const state = loadState();
   if (!state) {
     const autoUpdateRemoved = disableMacAutoUpdateAgent();
-    return finalize({ noop: true, reason: 'not_installed', autoUpdateRemoved });
+    const wrapperRestored = restorePlainDaemonWrapper();
+    return finalize({ noop: true, reason: 'not_installed', autoUpdateRemoved, wrapperRestored });
   }
   const warnings = [];
   const autoUpdateRemoved = disableMacAutoUpdateAgent();
+  const wrapperRestored = restorePlainDaemonWrapper();
   const settings = await revertStepUnlock(state);
   if (settings.live && !settings.live.ok && settings.live.appRunning !== false) warnings.push(`live settings revert: ${settings.live.reason}`);
   const files = restoreUserLayer(state);
@@ -1110,7 +1263,7 @@ async function cmdUninstall() {
   fs.rmSync(STATE_DIR, { recursive: true, force: true });
   fs.rmSync(LEGACY_SYNC_LOG_FILE, { force: true });
   const verify = runUpstreamVerify();
-  return finalize({ autoUpdateRemoved, settings, files, ruleRemoved, verify }, { warnings });
+  return finalize({ autoUpdateRemoved, wrapperRestored, settings, files, ruleRemoved, verify }, { warnings });
 }
 
 async function main(argv) {

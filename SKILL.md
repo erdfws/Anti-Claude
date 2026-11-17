@@ -1,6 +1,6 @@
 ---
 name: antigravity-claude-ux
-description: Deploy the 1:1 Claude Desktop (Code / Cowork) UI, typography, stratified model selector, live context & plan quota popover, interleaved step stream, and cross-turn auto-docking TodoWrite checklist card onto Google Antigravity Desktop 2.0 via non-invasive CDP runtime injection.
+description: Deploy the 1:1 Claude Desktop (Code / Cowork) UI, typography, stratified model selector, live context & plan quota popover, interleaved step stream, and in-flow live TodoWrite checklist card onto Google Antigravity Desktop 2.0 via non-invasive CDP runtime injection.
 ---
 
 # Antigravity Claude UX — Agent Auto-Deployment Skill
@@ -10,7 +10,7 @@ Only run these steps when the user **explicitly asks to install, update, or unin
 The installer changes user config (theme-patch `user/` files, `product_skin`, `verboseConversationSteps`, a rule block in `~/.gemini/AGENTS.md`) and records every change for rollback. Tell the user this before running it.
 
 ## Prerequisites
-- Google Antigravity Desktop 2.0 (`v2.30+`, tested on `v2.32.1`) on macOS or Windows
+- Google Antigravity Desktop 2.0 (`v2.30+`, tested through `v2.32.2`) on macOS or Windows
 - Node.js `>= 22`
 
 ## 1-Step Installation (Fresh Install or Update to Latest)
@@ -27,10 +27,10 @@ The installer changes user config (theme-patch `user/` files, `product_skin`, `v
 2. What `node install.mjs install` automatically handles:
    - Installs upstream `Anarcadia/chuanban-antigravity-theme-patch` (`~/.gemini/antigravity/theme-patch`) if not yet present;
    - Automatically copies official Anthropic variable fonts from `/Applications/Claude.app/Contents/Resources/fonts` on macOS if `Claude.app` is installed locally;
-   - Backs up existing `theme-patch/user/` files to `.backup-before-claude-ux/` and deploys all 4 user-layer files (`config.json`, `custom.css`, `custom.js`, `i18n.override.json`);
-   - Enables the 1:1 Claude stratified Model Selector (`模型 · 本次会话`, `1–4` quick keys, separate `思考强度 >` & `更多模型 >` flyouts), radial Context Progress Ring + live 5h/weekly Quota Popover, clean `tok/s · TTFT` pill (stripping `+sub` clutter), and Claude-matched Settings sidebar;
+   - Backs up existing `theme-patch/user/` files under `~/.gemini/antigravity/claude-ux/backup/` (plus `base/` 3-way JSON merge baselines and `install-state.json` rollback manifest) and deploys all 4 user-layer files (`config.json`, `custom.css`, `custom.js`, `i18n.override.json`);
+   - Enables the 1:1 Claude stratified Model Selector (`模型 · 本次会话`, `1–4` quick keys, separate `思考强度 >` & `更多模型 >` flyouts), radial Context Progress Ring + live 5h/weekly Quota Popover, clean `tok/s · TTFT` pill (stripping `+sub` clutter), opaque `/` & `@` typeahead popups, and pure-text Claude Settings sidebar;
    - Unlocks Antigravity's hidden Developer Step Stream (`project4kMode = 1` / `PRODUCT_SKIN_DEVELOPER` + `verboseConversationSteps = true`) via live CDP and persistent config so intermediate tool & MCP calls are never wiped;
-   - Prepends an idempotent `<!-- BEGIN antigravity-claude-ux -->` rule block to `~/.gemini/AGENTS.md` enabling Claude-style mid-turn progress updates and cross-turn auto-docking 3-state `- [ ]` / `- [/]` / `- [x]` live checklist cards;
+   - Prepends an idempotent `<!-- BEGIN antigravity-claude-ux -->` rule block to `~/.gemini/AGENTS.md` enabling Claude-style mid-turn progress updates, invisible `<!-- todo:N/M -->` progression, official-blue orbiting step timers (`#2F75C3` / `#2F71E3`), and in-flow 3-state `- [ ]` / `- [/]` / `- [x]` live checklist cards compatible with both Developer and Knowledge Work modes;
    - Registers the `0-token` macOS `launchd` auto-sync watcher (`com.antigravity.claude-ux.autosync`) and triggers immediate hot-reload in the running Antigravity window without restarting the app.
 
 ## Clean Rollback

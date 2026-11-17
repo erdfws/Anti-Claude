@@ -364,3 +364,71 @@ test('follow-up live turn relays incomplete checklist and advances via <!-- todo
   h.cleanups.forEach((fn) => fn());
   h.close();
 });
+
+test('Knowledge Work mode: final all-[x] DOM <ul> still renders as TodoWrite card when container.steps had [/] origin, while ordinary checklists stay native', { skip }, async () => {
+  const h = mount(
+    pane([
+      ul(li('首航体检', 'completed'), li('查更新日志', 'completed'), li('汇总报告', 'completed')),
+      ul(li('身份证复印件', 'completed'), li('合同原件'))
+    ])
+  );
+  const turns = h.doc.querySelectorAll('[data-testid="agent-response"]');
+  turns[0].__reactFiber$t = {
+    memoizedProps: {},
+    return: {
+      memoizedProps: {
+        container: {
+          steps: [
+            {
+              step: {
+                case: 'plannerResponse',
+                value: { response: '- [/] 首航体检\n- [ ] 查更新日志\n- [ ] 汇总报告' }
+              }
+            },
+            {
+              step: {
+                case: 'plannerResponse',
+                value: { response: '- [x] 首航体检\n- [x] 查更新日志\n- [x] 汇总报告' }
+              }
+            }
+          ]
+        }
+      }
+    }
+  };
+  turns[1].__reactFiber$t = {
+    memoizedProps: {},
+    return: {
+      memoizedProps: {
+        container: {
+          steps: [{ step: { case: 'plannerResponse', value: { response: '- [x] 身份证复印件\n- [ ] 合同原件' } } }]
+        }
+      }
+    }
+  };
+  turns[0].appendChild(h.doc.createElement('span'));
+  await settle(h);
+
+  const cards = h.doc.querySelectorAll('.ag-claude-todo-card');
+  assert.equal(cards.length, 1, 'only the execution-progress list becomes a card');
+  const cardStatuses = Array.from(cards[0].querySelectorAll('.ag-claude-todo-row')).map((r) => r.getAttribute('data-status'));
+  assert.deepEqual(cardStatuses, ['completed', 'completed', 'completed']);
+  assert.equal(turns[1].querySelector('ul').hasAttribute('data-ag-todo-primary'), false, 'ordinary answer checklist untouched');
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});
+
+test('Knowledge Work mode live turn: mounts live dock card from container.steps even when zero <ul> exist in DOM', { skip }, async () => {
+  const h = mount(
+    pane(['<button type="button" data-testid="progress-updates-collapsible" aria-expanded="false">已工作 12s · 2 条进展</button>'], {
+      generating: true
+    })
+  );
+  attachTurnSteps(h, ['- [/] 阶段一\n- [ ] 阶段二\n- [ ] 阶段三', '推进第二阶段。<!-- todo:2/3 -->']);
+  const turn = h.doc.querySelector('[data-testid="agent-response"]');
+  turn.appendChild(h.doc.createElement('span'));
+  await settle(h);
+  assert.deepEqual(dockStatuses(h), ['completed', 'in_progress', 'pending']);
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});

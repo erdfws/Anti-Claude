@@ -512,7 +512,7 @@
     return false;
   }
 
-  function harvestStepChecklists(turnEl) {
+  function harvestStepChecklists(turnEl, isLiveTurn = true) {
     if (!turnEl) return false;
     const steps = turnStepsOf(turnEl);
     if (!steps || !steps.length) return false;
@@ -524,8 +524,8 @@
       if (!v || typeof v !== 'object') continue;
       const text = v.modifiedResponse || v.response || '';
       if (!text) continue;
-      /* Always re-evaluate the trailing planner step in case SSE appended `<!-- todo:N/M -->` without a DOM childList mutation */
-      if (idx < lastIdx && stepScanState.get(v) === text.length) continue;
+      /* Re-evaluate the trailing planner step on live turns in case SSE appended `<!-- todo:N/M -->` without a DOM childList mutation */
+      if ((!isLiveTurn || idx < lastIdx) && stepScanState.get(v) === text.length) continue;
       stepScanState.set(v, text.length);
 
       for (const items of extractTaskLists(text)) {
@@ -564,12 +564,54 @@
     return todoProgress(next) > todoProgress(items) ? next : items;
   }
 
+  function turnHasActiveTodoOrigin(turnEl, items) {
+    const mem = turnEl && turnTodoMemory.get(turnEl);
+    if (!mem || !items) return false;
+    for (const rec of mem.values()) {
+      if (hasActiveTodo(rec.items) && isChecklistEvolution(rec.items, items)) return true;
+    }
+    return false;
+  }
+
+  /*
+   * In Knowledge Work (`PRODUCT_SKIN_NON_TECHNICAL`), mid-turn planner steps are collapsed inside
+   * `progress-updates-collapsible` without mounting `<ul class="contains-task-list">`, leaving only the final
+   * all-`[x]` `<ul>` in the DOM. Check `turnTodoMemory` (populated from `container.steps`) on `turnEl` and
+   * preceding turns in the same pane so execution checklists still render as `.ag-claude-todo-card` while
+   * ordinary `[ ] / [x]` answer checklists (which never had an `[/]` step) stay untouched.
+   */
+  function findStepActiveOriginTurns(paneTurns, turnEl, items) {
+    if (!turnEl || !items) return [];
+    if (turnHasActiveTodoOrigin(turnEl, items)) return [turnEl];
+    if (!paneTurns || !paneTurns.length) return [];
+    const endIdx = paneTurns.indexOf(turnEl);
+    const upper = endIdx >= 0 ? endIdx : paneTurns.length;
+    for (let i = upper - 1; i >= 0; i--) {
+      const prevTurn = paneTurns[i];
+      if (turnHasActiveTodoOrigin(prevTurn, items)) return [prevTurn, turnEl];
+    }
+    return [];
+  }
+
+  function bestRememberedInTurn(turnEl) {
+    const mem = turnEl && turnTodoMemory.get(turnEl);
+    if (!mem || mem.size === 0) return null;
+    let best = null;
+    for (const rec of mem.values()) {
+      if (!best || rec.progress > best.progress || (rec.progress === best.progress && rec.seq > best.seq)) {
+        best = rec;
+      }
+    }
+    return best;
+  }
+
   /**
    * Only *execution-progress* checklists are taken over:
-   *  - a cluster starts with a list containing an active `[/]` item (the marker the AGENTS.md rule mandates);
+   *  - a cluster starts with a list containing an active `[/]` item (either mounted in DOM or recorded in
+   *    `container.steps` when Knowledge Work mode hides mid-turn steps);
    *  - later lists join it when they evolve from it (same items) or, across turns, when they still look like
    *    progress (`[/]` present or 100% done).
-   * Ordinary answer checklists (materials, review points: only `[ ]` / `[x]`, no `[/]`) stay native and visible.
+   * Ordinary answer checklists (materials, review points: only `[ ]` / `[x]`, no `[/]` anywhere) stay native.
    * A taken-over list is never hidden without a visible replacement card.
    */
   function syncTodoCards(panes) {
@@ -578,12 +620,25 @@
 
     if (FEAT.todoCard) {
       hideLegacyProgressParagraphs();
+
+      const paneMeta = new Map();
+      for (const pane of panes) {
+        const paneLive = isPaneActivelyGenerating(pane);
+        const paneTurns = Array.from(pane.root.querySelectorAll('[data-testid="agent-response"]'));
+        const latestPaneTurn = paneTurns.length ? paneTurns[paneTurns.length - 1] : null;
+        for (const tEl of paneTurns) {
+          harvestStepChecklists(tEl, paneLive && tEl === latestPaneTurn);
+        }
+        paneMeta.set(pane, { paneLive, paneTurns, latestPaneTurn });
+      }
+
       const byPane = new Map();
       for (const ul of document.querySelectorAll('ul.contains-task-list')) {
         const items = parseTodoUl(ul);
         if (!items) continue;
         const turnEl = ul.closest('[data-testid="agent-response"]');
         const pane = turnEl ? paneFor(turnEl, panes) : null;
+        if (turnEl && !pane) harvestStepChecklists(turnEl, false);
         const key = pane || ul; /* orphan lists form their own group */
         let group = byPane.get(key);
         if (!group) {
@@ -597,6 +652,11 @@
       const handledLiveTurns = new Set();
 
       for (const group of byPane.values()) {
+        const meta = group.pane ? paneMeta.get(group.pane) : null;
+        const paneTurns = meta ? meta.paneTurns : null;
+        const paneLive = Boolean(meta && meta.paneLive);
+        const latestPaneTurn = meta ? meta.latestPaneTurn : null;
+
         const clusters = [];
         for (const entry of group.entries) {
           const last = clusters[clusters.length - 1];
@@ -619,32 +679,27 @@
               last.lastTurnEl = entry.turnEl;
               if (!last.turnEls.includes(entry.turnEl)) last.turnEls.push(entry.turnEl);
             }
-          } else if (active) {
-            clusters.push({
-              lists: [entry.ul],
-              items: entry.items,
-              lastTurnEl: entry.turnEl || null,
-              turnEls: entry.turnEl ? [entry.turnEl] : []
-            });
+          } else {
+            const originTurns = active
+              ? entry.turnEl
+                ? [entry.turnEl]
+                : []
+              : findStepActiveOriginTurns(paneTurns, entry.turnEl, entry.items);
+            if (active || originTurns.length > 0) {
+              clusters.push({
+                lists: [entry.ul],
+                items: entry.items,
+                lastTurnEl: entry.turnEl || null,
+                turnEls: originTurns.length ? originTurns : entry.turnEl ? [entry.turnEl] : []
+              });
+            }
           }
           /* else: ordinary checklist, left untouched */
-        }
-
-        const pane = group.pane;
-        const paneLive = Boolean(pane) && isPaneActivelyGenerating(pane);
-        let latestPaneTurn = null;
-        if (pane) {
-          const paneTurns = pane.root.querySelectorAll('[data-testid="agent-response"]');
-          latestPaneTurn = paneTurns.length ? paneTurns[paneTurns.length - 1] : null;
-          harvestStepChecklists(latestPaneTurn);
         }
 
         for (let i = 0; i < clusters.length; i++) {
           const cluster = clusters[i];
           for (const ul of cluster.lists) touched.add(ul);
-          for (const tEl of cluster.turnEls) {
-            if (tEl !== latestPaneTurn) harvestStepChecklists(tEl);
-          }
 
           /* Relay: if a follow-up live turn continues an incomplete checklist without re-emitting <ul>, attach latestPaneTurn */
           const isLastCluster = i === clusters.length - 1;
@@ -685,23 +740,23 @@
         }
       }
 
-      /* Fallback when ALL <ul> nodes in the live turn were unmounted off-screen by step virtualisation */
+      /* Fallback when ALL <ul> nodes in the live turn were unmounted off-screen or hidden in Knowledge Work mode */
       for (const pane of panes) {
-        if (!isPaneActivelyGenerating(pane)) continue;
-        const paneTurns = pane.root.querySelectorAll('[data-testid="agent-response"]');
-        const latestPaneTurn = paneTurns.length ? paneTurns[paneTurns.length - 1] : null;
-        if (!latestPaneTurn || handledLiveTurns.has(latestPaneTurn)) continue;
-        harvestStepChecklists(latestPaneTurn);
-        const mem = turnTodoMemory.get(latestPaneTurn);
-        if (!mem || mem.size === 0) continue;
-        let best = null;
-        for (const rec of mem.values()) {
-          if (!best || rec.progress > best.progress || (rec.progress === best.progress && rec.seq > best.seq)) {
-            best = rec;
+        const meta = paneMeta.get(pane);
+        if (!meta || !meta.paneLive || !meta.latestPaneTurn || handledLiveTurns.has(meta.latestPaneTurn)) continue;
+        const { paneTurns, latestPaneTurn } = meta;
+        let best = bestRememberedInTurn(latestPaneTurn);
+        let turnScope = [latestPaneTurn];
+        if (!best && paneTurns.length >= 2) {
+          const prevTurn = paneTurns[paneTurns.length - 2];
+          const prevBest = bestRememberedInTurn(prevTurn);
+          if (prevBest && !isAllTodoCompleted(prevBest.items)) {
+            best = prevBest;
+            turnScope = [prevTurn, latestPaneTurn];
           }
         }
-        if (best && hasActiveTodo(best.items)) {
-          const items = applyProgressMarker(latestPaneTurn, best.items);
+        if (best && (hasActiveTodo(best.items) || turnScope.some((t) => turnHasActiveTodoOrigin(t, best.items)))) {
+          const items = applyProgressMarker(turnScope, best.items);
           const mountedDock = renderLiveDockedTodoCard(latestPaneTurn, items);
           if (mountedDock) activeDocks.add(mountedDock);
         }
@@ -806,13 +861,14 @@
       document.querySelectorAll('.ag-orbit-dots, .ag-elapsed-timer').forEach((n) => n.remove());
     }
 
-    if (activeCount > 0 && !timerIntervalId) {
+    const keepPolling = activeCount > 0 || (FEAT.todoCard && globalGenerating);
+    if (keepPolling && !timerIntervalId) {
       timerIntervalId = setInterval(() => {
         const ps = collectPanes();
         syncTodoCards(ps);
         syncRunningToolIndicators(ps);
       }, 1000);
-    } else if (activeCount === 0 && timerIntervalId) {
+    } else if (!keepPolling && timerIntervalId) {
       clearInterval(timerIntervalId);
       timerIntervalId = null;
     }
@@ -2037,7 +2093,7 @@
   const OWN_SEL =
     '.ag-claude-todo-card, .ag-claude-todo-live-dock, .ag-collapse-ghost, .ag-orbit-dots, .ag-elapsed-timer, #ag-claude-ctx-ring, #ag-claude-quota-popover, #ag-claude-model-popover, #ag-claude-model-subpop';
   const CLASS_WATCH_SEL =
-    'ul.contains-task-list, [id="antigravity.agentSidePanelInputBox"], [data-testid="tool-group-collapsible"], [data-testid="worked-for-collapsible"]';
+    'ul.contains-task-list, [id="antigravity.agentSidePanelInputBox"], [data-testid="tool-group-collapsible"], [data-testid="worked-for-collapsible"], [data-testid="progress-updates-collapsible"], [data-testid="ephemeral-tool-status"]';
 
   function isOwnNode(n) {
     const el = n && (n.nodeType === 1 ? n : n.parentElement);

@@ -5,7 +5,7 @@
  * 2. Adds smooth 190ms collapse transition when React unmounts finished `tool-group-collapsible` panels.
  * 3. Renders an in-place reactive Claude `TodoWrite` checklist card (`- [ ]` pending / `- [/]` active / `- [x]` completed),
  *    deduplicating and merging all checklist updates within the same turn into a single card.
- * 4. Attaches orbiting terracotta dots + live `1s / 2s...` elapsed timer exclusively to the actively executing step row.
+ * 4. Attaches orbiting official-blue dots + live `1s / 2s...` elapsed timer exclusively to the actively executing step row.
  *
  * Feature switches (user/config.json -> "modules", all default true):
  *   claudeUxStepUnfold, claudeUxCollapseAnimation, claudeUxTodoCard, claudeUxRunningTimer,

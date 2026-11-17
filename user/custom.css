@@ -585,7 +585,7 @@ div[data-ag-inline-stream="true"] > button[data-testid="worked-for-collapsible"]
   border-top: 1px solid var(--border, rgba(0, 0, 0, 0.06)) !important;
 }
 
-/* 3.9 Claude TodoWrite Live In-Flow Bottom-Following Card + Solid Circle Checkmark + Terracotta Orbiting Timer */
+/* 3.9 Claude TodoWrite Live In-Flow Bottom-Following Card + Solid Circle Checkmark + Official Blue Orbiting Timer */
 ul[data-ag-todo-primary="true"],
 ul[data-ag-todo-merged="true"],
 p[data-ag-todo-marker-line="true"],
@@ -786,7 +786,7 @@ html:not([data-ag-theme-mode="dark"]) body:not(.dark) .ag-claude-todo-card > .ag
   height: 5px;
   top: 2px;
   left: 2px;
-  background-color: #D97757;
+  background-color: var(--primary, #2F75C3);
 }
 
 .ag-orbit-dots > i:last-child {
@@ -794,7 +794,15 @@ html:not([data-ag-theme-mode="dark"]) body:not(.dark) .ag-claude-todo-card > .ag
   height: 3.5px;
   bottom: 2px;
   right: 2px;
-  background-color: #E69D82;
+  background-color: #7BAEE6;
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) .ag-orbit-dots > i:first-child {
+  background-color: var(--primary, #2F71E3);
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) .ag-orbit-dots > i:last-child {
+  background-color: #78A9FF;
 }
 
 .ag-elapsed-timer {

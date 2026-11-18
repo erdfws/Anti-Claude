@@ -1,6 +1,6 @@
 # Antigravity Claude UX
 
-**Bring the exact macOS Claude Desktop (Code / Cowork) aesthetic, stratified model selector, live plan quota ring, interleaved step narration, and in-flow live `TodoWrite` checklist cards to Google Antigravity Desktop 2.0 — 100% via non-invasive CDP runtime injection.**
+**Bring the exact macOS Claude Desktop (Code / Cowork) aesthetic, stratified model selector, live plan quota ring, in-bubble undo & edit, sidebar top Recents & collapsed folder status badges, in-app module switches, interleaved step narration, and in-flow live `TodoWrite` checklist cards to Google Antigravity Desktop 2.0 — 100% via non-invasive CDP runtime injection.**
 
 [中文说明](#-功能亮点) · [Quick Start](#-一键安装-quick-start) · [Architecture](#-工作原理-how-it-works) · [English Summary](#english-summary)
 
@@ -52,7 +52,12 @@
   - 若中途打断，未完成的卡片保留在原位并标注「已暂停」（停止旋转），内容始终可见；
   - 当所有条目 **100% 打勾完工**（复刻 Claude `#666666` 实心圆白勾）后，卡片自动落位归档在总结上方作为完工记录。
 
-### 5. 客户端版本更新自动跟随 & `v2.33.0+` 调试端口无感自愈（0 Token 守护）
+### 5. 原地撤回重编消息、侧栏「最近对话」& 折叠项目角标、设置内嵌「界面增强」面板
+- **气泡内原地撤回重编（`claudeUxInlineUndo`）**：无损拦截用户消息悬停 `撤回` 按钮，直接在原气泡位置展开浅灰/暖炭无框内联编辑卡（浅色 `#F6F6F4` / 深色 `#282826`，摒弃突兀彩色粗框），自动调取客户端原生 `getRevertPreviews` 列出将回滚的代码文件胶囊，内置「同步撤回文件」开关（直连 `revertPreviewState.setConversationOnly`）并完整保留原消息附图/媒体附件，按 `⌘↵` 或点「重新发送」即可通过 `inputBoxRef.current.submit()` 原地回退重发。
+- **侧栏顶部「最近对话」与折叠项目聚合角标（`claudeUxRecentSection` / `claudeUxFolderStatus`）**：直接订阅客户端内存 Redux `trajectorySummaries`（`0` 外部网络请求、插入在虚拟滚动视口外层绝不破坏列表 `translateY` 偏移），在侧栏顶部固定展示可折叠的「最近对话」（按 `待确认 > 运行中 > 最近活跃` 智能置顶，默认 4 条、可展开至 8 条，基于 TanStack Router `0ms` 无刷秒切）；同时在已折叠的项目文件夹右侧聚合展示琥珀色待确认图标（终端命令 / 权限审批 / 追问等待）、官方蓝运行双点及未读蓝点计数，鼠标悬停项目行时自动淡出让位给原生 `+ / ⋯` 操作钮。
+- **原生设置页内嵌「界面增强」可视化面板（`settingsPanel`）**：在客户端原生设置左侧导航栏「外观」下方注入纯文字「界面增强」入口，右侧提供 **9 项核心功能即时开关**与「恢复默认」，点击即刻 `0ms` 热生效并持久化至 `localStorage`，无需手改配置文件或重启客户端。
+
+### 6. 客户端版本更新自动跟随 & `v2.33.0+` 调试端口无感自愈（0 Token 守护）
 - **`Antigravity v2.33.0+` 免改签名冷启动 CDP 自愈**：`v2.33.0` 移除了原版默认内置的 `--remote-debugging-port=0` 并在启动时主动清理旧 `DevToolsActivePort`；安装器自动在常驻主题守护入口（`antigravity-font-daemon.mjs`）注入零开销引导——每当从 Dock、Spotlight 或客户端「重启以更新」刚拉起未带调试端口的新进程（启动 `<= 25s`），1 秒内自动无感补挂 `--remote-debugging-port=0`（完全不触碰 `/Applications/Antigravity.app` 原厂签名，零 Gatekeeper 拦截、不影响 Squirrel 应用内自更新，且绝不打断运行超过 `25s` 的存量会话）。
 - macOS 安装时默认注册 `launchd` `WatchPaths` 守护（`com.antigravity.claude-ux.autosync`），监听 `Antigravity.app` 更新（若本机部署了双开副实例 `Antigravity 2.app` 也会随版本升级自动重同步），并每 12 小时检查本仓库更新（`git pull --ff-only`，拉取后先做语法与 JSON 校验再部署；已通过 `v2.32.2` → `v2.33.0` 跨大版本实机自愈验收）。
 - 上游内核锁定在经过验证的提交（`install.mjs` 中的 `UPSTREAM_REF`，当前基线 `v5.4.2`：含 `plugin://swarm--` 子帧实时主题同步、`NewDocument` 0ms 防闪白与外观设置 `[ 🖥️ | ☀️ | 📖 | 🌙 ]` 四段切换），只升级、不会把你手动装的新版内核降级。
@@ -99,14 +104,17 @@ node ~/Developer/antigravity-claude-ux/install.mjs uninstall
 
 安装选项：`--no-auto-update`、`--no-step-unlock`（不改步骤开关）、`--no-agents-rule`（不插入规则）、`--overwrite-local`。
 
-### 功能开关（排障用）
-在 `~/.gemini/antigravity/theme-patch/user/config.json` 的 `modules` 中把对应项设为 `false` 即可单独关闭，热重载生效：
+### 功能开关（可视化面板 + 配置文件双通道）
+日常可直接在客户端 **设置 → 界面增强** 面板中可视化即时开关以下全部 9 项模块（`0ms` 热生效，状态保存在 `localStorage`）；也可在 `~/.gemini/antigravity/theme-patch/user/config.json` 的 `modules` 中把对应项设为 `false` 作为默认基线：
 
 | 开关 | 作用 |
 | :--- | :--- |
+| `claudeUxInlineUndo` | 气泡内原地撤回重编消息与「同步撤回文件」开关 |
+| `claudeUxRecentSection` | 侧边栏顶部可折叠「最近对话」无刷秒切区 |
+| `claudeUxFolderStatus` | 折叠项目文件夹右侧待确认 / 运行中 / 未读聚合角标 |
+| `claudeUxTodoCard` | 流内实时跟随 `TodoWrite` 执行进度卡片 |
 | `claudeUxStepUnfold` | 自动展开回合末「已工作 Xm」 |
 | `claudeUxCollapseAnimation` | 工具面板收起动画 |
-| `claudeUxTodoCard` | 执行进度卡片 |
 | `claudeUxRunningTimer` | 运行中旋转点与读秒 |
 | `claudeUxContextRing` | 上下文圆环、限额浮层、底栏精简 |
 | `claudeUxModelMenu` | 分层模型菜单（关闭后恢复原生菜单） |
@@ -118,7 +126,7 @@ node ~/Developer/antigravity-claude-ux/install.mjs uninstall
 npm i --no-save jsdom   # 可选：DOM 测试依赖，缺失时自动跳过
 node --test test/
 ```
-覆盖 35 项自动化测试（安装—同步—卸载—重复卸载、原文件缺失、用户配置三方合并、上游校验失败、CDP 断连/超时/异常、普通清单不被接管、热重载清理、键盘打开菜单、多窗格读秒、`<!-- todo:N/M -->` 隐形进度、代码段防误触、React `fiber.alternate` 双缓冲读取、跨轮接力、「知识工作」模式兼容及 `v2.33.0+` 分页虚拟滚动 `trajectorySlice.stepsInSlice` 溯源等场景）。未覆盖：真机像素比对、Windows 安装路径。
+覆盖 38 项自动化测试（安装—同步—卸载—重复卸载、原文件缺失、用户配置三方合并、上游校验失败、CDP 断连/超时/异常、普通清单不被接管、热重载清理、键盘打开菜单、多窗格读秒、`<!-- todo:N/M -->` 隐形进度、代码段防误触、React `fiber.alternate` 双缓冲读取、跨轮接力、「知识工作」模式兼容、`v2.33.0+` 分页虚拟滚动 `trajectorySlice.stepsInSlice` 溯源、气泡内原地撤回重编与文件回滚开关、折叠项目角标与顶部「最近对话」路由秒切、原生设置页「界面增强」即时开关持久化等场景）。未覆盖：真机像素比对、Windows 安装路径。
 
 ---
 
@@ -164,6 +172,7 @@ node --test test/
 - **Pixel-Matched `Claude.app` Visuals & Settings (`user/custom.css`)**: Pure `#FFFFFF` light canvas & `#212120` warm charcoal dark palette, unified `14px` sans-serif typography (`Anthropic Sans` + `PingFang SC`), clean single-layer `18px` composer with opaque `/` & `@` typeahead popups (plus `#ECECEA` dark send orb & `#383835` idle voice button, stripping `+sub` badge noise), and a pure-text Claude-styled Settings sidebar paired with Google official blue (`#2F75C3` / `#2F71E3`) controls and active orbiting step dots.
 - **Stratified Claude Model Menu & Live Plan Quota Ring (`user/custom.js`)**: Replaces the crowded 9-row flat model dropdown with a clean Claude-style popover featuring the 4 core Gemini models (`1–4` hotkeys) plus dedicated `Thinking Effort >` (`Low / Medium / High / XHigh`) and `More Models >` flyouts wired directly to Antigravity's native React Fiber `setSelectedModel`. Adds a radial context progress ring next to the model pill that opens a real-time `5h / weekly` plan quota popover via `retrieveUserQuotaSummary`.
 - **In-Flow `TodoWrite` Card, Knowledge Work & `v2.33+` Virtual-Scroll Compatibility (`install.mjs` + `user/custom.js`)**: Unlocks `PRODUCT_SKIN_DEVELOPER` + `verboseConversationSteps: true` and unwraps end-of-turn accordions. Mounts active `- [ ]` / `- [/]` / `- [x]` checklists **in-flow at the bottom of the active turn** (scrolling naturally with history without obscuring text), advances mid-turn via zero-noise invisible `<!-- todo:N/M -->` comments across React `fiber` / `fiber.alternate` in **both Developer and Knowledge Work modes**, preserves bordered cards across `v2.33.0+` `autoscroll-viewport` virtualized turns via `trajectorySlice.stepsInSlice` origin lookup, relays incomplete checklists across follow-up turns, marks interrupted checklists as `Paused` (`已暂停`) in place, and settles `100%` completed cards with `#666666` solid-circle checkmarks.
+- **In-Bubble Undo & Edit, Sidebar Top Recents & Collapsed Folder Badges, and Native Settings `界面增强` Panel (`user/custom.js` + `user/custom.css`)**: Intercepts user-message `Revert` (`撤回`) into a clean `#F6F6F4` / `#282826` in-bubble editor with live modified-file chips (`getRevertPreviews`), a `同步撤回文件` toggle (`setConversationOnly`), preserved media attachments, and `⌘↵` resend via `inputBoxRef.current.submit()`. Subscribes directly to Redux `trajectorySummaries` (`0` network calls) to mount a collapsible top `最近对话` (`Recents`) section (`pending > running > recent`, `0ms` TanStack Router navigation) plus right-aligned pending/running/unread badges on collapsed project folders. Adds a native `设置 → 界面增强` pane with 9 `0ms` live-toggling module switches persisted to `localStorage`.
 - **`v2.33.0+` Zero-Touch CDP Bootstrap & Auto-Sync Watcher**: Handles Google Antigravity `v2.33.0+`'s removal of default `--remote-debugging-port=0` on macOS without modifying `Antigravity.app` or breaking Apple Developer ID / Squirrel auto-updates — freshly launched (`<= 25s`) non-CDP instances are automatically re-opened with `--remote-debugging-port=0` within `1s`, paired with `com.antigravity.claude-ux.autosync` and upstream `chuanban-antigravity-theme-patch` `v5.4.2`.
 
 ---

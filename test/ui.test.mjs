@@ -504,3 +504,208 @@ test('v2.33+ trajectorySlice.stepsInSlice: recovers [/] origin when earlier turn
   h.cleanups.forEach((fn) => fn());
   h.close();
 });
+
+test('inline undo & edit: expands in-bubble editor, previews modified files, toggles file revert, and resends via host', { skip }, async () => {
+  const h = mount(`
+    <div data-testid="user-input-step">
+      <div class="max-w-[80%]">
+        <div data-testid="user-message-bubble">
+          <div data-testid="user-message-content">原始提问内容</div>
+        </div>
+      </div>
+      <button type="button" data-testid="revert-button">撤回</button>
+    </div>
+    <div data-testid="agent-input-box"><div id="lex-root"></div></div>
+  `);
+  const revBtn = h.doc.querySelector('button[data-testid="revert-button"]');
+  const lexRoot = h.doc.getElementById('lex-root');
+  let submitted = false;
+  let convOnlyVal = false;
+  const stepHandler = {
+    getRevertPreviews: async () => [{ fileUri: 'file:///repo/user/custom.js' }, { fileUri: 'file:///repo/user/custom.css' }],
+    revertToIndex: async () => true
+  };
+  const revertPreviewState = {
+    get conversationOnly() {
+      return convOnlyVal;
+    },
+    conversationOnlyRevertEnabled: true,
+    setConversationOnly(v) {
+      convOnlyVal = v;
+    },
+    revert() {
+      stepHandler.revertToIndex('11111111-2222-3333-4444-555555555555', 4);
+    }
+  };
+  revBtn.__reactFiber$r = {
+    memoizedProps: {
+      revertState: { canRevert: true, revertPreviewState },
+      cascadeId: '11111111-2222-3333-4444-555555555555',
+      userStepIndex: 5,
+      items: [{ chunk: { case: 'text', value: '原始提问内容' } }]
+    },
+    dependencies: {
+      firstContext: {
+        memoizedValue: {
+          stepHandler,
+          inputBoxRef: {
+            current: {
+              lexicalRef: { current: { getRootElement: () => lexRoot } },
+              getMediaAttachments: () => [],
+              submit: () => {
+                submitted = true;
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  revBtn.click();
+  await new Promise((r) => setTimeout(r, 30));
+  const editor = h.doc.querySelector('.ag-claude-inline-editor');
+  assert.ok(editor, 'in-bubble editor mounted');
+  assert.equal(h.doc.querySelector('[data-testid="user-message-content"]').hidden, true, 'original bubble content hidden while editing');
+  assert.match(editor.textContent, /custom\.js/, 'file revert preview chips rendered');
+
+  const fileSwitch = editor.querySelector('[data-ag-revert-files-switch]');
+  assert.equal(fileSwitch.getAttribute('aria-checked'), 'true');
+  fileSwitch.click();
+  assert.equal(convOnlyVal, true, 'file revert switch updates conversationOnly');
+
+  const ta = editor.querySelector('.ag-claude-inline-textarea');
+  ta.value = '修改后的新提问';
+  ta.dispatchEvent(new h.window.Event('input', { bubbles: true }));
+  editor.querySelector('[data-ag-inline-send]').click();
+  await new Promise((r) => setTimeout(r, 430));
+
+  assert.equal(lexRoot.textContent, '修改后的新提问', 'edited prompt written to host composer');
+  assert.equal(submitted, true, 'host submit() invoked after revert');
+  assert.equal(h.doc.querySelector('.ag-claude-inline-editor'), null, 'inline editor cleaned up');
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});
+
+test('sidebar folder status badges & top Recents: aggregates collapsed folders, sorts pending > running > recent, and navigates via router', { skip }, async () => {
+  const h = mount(`
+    <div class="sidebar-grand">
+      <div class="sidebar-parent">
+        <div data-testid="conversation-list-sidebar">
+          <div>
+            <div data-sidebar-section-drop-id="proj-a">
+              <div class="group/header"><button type="button" data-testid="project-header" data-project-label="项目A" aria-expanded="false">项目A</button></div>
+            </div>
+            <div data-sidebar-section-drop-id="proj-b">
+              <div class="group/header"><button type="button" data-testid="project-header" data-project-label="项目B" aria-expanded="true">项目B</button></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `);
+  let navigatedTo = null;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const storeState = {
+    trajectorySummaries: {
+      summaries: {
+        'conv-idle-unread': {
+          annotations: { title: '已完成未读任务', lastUserViewTime: { seconds: nowSec - 600 } },
+          lastModifiedTime: { seconds: nowSec - 60 },
+          trajectoryMetadata: { projectId: 'proj-a' },
+          status: 1
+        },
+        'conv-running': {
+          annotations: { title: '正在后台编译' },
+          lastModifiedTime: { seconds: nowSec - 300 },
+          trajectoryMetadata: { projectId: 'proj-b' },
+          status: 2
+        },
+        'conv-pending': {
+          annotations: { title: '等待终端命令确认' },
+          lastModifiedTime: { seconds: nowSec - 900 },
+          trajectoryMetadata: { projectId: 'proj-a' },
+          waitingSteps: [{ metadata: { toolCall: { name: 'run_command' } } }],
+          status: 2
+        }
+      }
+    }
+  };
+  const sb = h.doc.querySelector('[data-testid="conversation-list-sidebar"]');
+  sb.firstElementChild.__reactFiber$sb = {
+    memoizedProps: {
+      sidebarStore: { getState: () => storeState, subscribe: () => () => {} },
+      sidebarRouter: {
+        state: { location: { pathname: '/' } },
+        navigate: (arg) => {
+          navigatedTo = arg;
+        }
+      },
+      sidebarGroups: [
+        { id: 'proj-a', label: '项目A', conversationIds: ['conv-idle-unread', 'conv-pending'] },
+        { id: 'proj-b', label: '项目B', conversationIds: ['conv-running'] }
+      ]
+    }
+  };
+  sb.appendChild(h.doc.createElement('span'));
+  await settle(h);
+
+  const hdrs = h.doc.querySelectorAll('button[data-testid="project-header"]');
+  const badgesA = hdrs[0].parentElement.querySelectorAll('.ag-claude-folder-badge');
+  const badgesB = hdrs[1].parentElement.querySelectorAll('.ag-claude-folder-badge');
+  assert.equal(badgesA.length, 2, 'collapsed proj-a renders pending + unread badges');
+  assert.equal(badgesA[0].getAttribute('data-kind'), 'pending');
+  assert.equal(badgesA[1].getAttribute('data-kind'), 'unread');
+  assert.equal(badgesB.length, 0, 'expanded proj-b suppresses folder badges');
+
+  const recentRows = h.doc.querySelectorAll('#ag-claude-recent-section .ag-recent-row');
+  assert.equal(recentRows.length, 3);
+  assert.deepEqual(
+    Array.from(recentRows).map((r) => r.getAttribute('data-ag-recent-id')),
+    ['conv-pending', 'conv-running', 'conv-idle-unread'],
+    'sorted by pending > running > recent'
+  );
+  recentRows[1].click();
+  assert.deepEqual(JSON.parse(JSON.stringify(navigatedTo)), { to: '/c/$cascadeId', params: { cascadeId: 'conv-running' } });
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});
+
+test('native Settings -> 界面增强 panel: injects nav item, switches pane, and live-toggles modules with localStorage persistence', { skip }, async () => {
+  const h = mount(`
+    <div data-split-root="true">
+      <div>
+        <div data-testid="settings-sidebar">
+          <div class="flex flex-col gap-0.5">
+            <div class="group/nav-item"><button type="button" data-testid="settings-nav-item-General" class="bg-sidebar-secondary"><span>常规</span></button></div>
+            <div class="group/nav-item"><button type="button" data-testid="settings-nav-item-Appearance"><span>外观</span></button></div>
+          </div>
+        </div>
+      </div>
+      <div>
+        <div id="settings-right-host"><div id="native-general-pane">原生常规内容</div></div>
+      </div>
+    </div>
+  `);
+  await settle(h);
+
+  const navBtn = h.doc.querySelector('button[data-testid="settings-nav-item-ClaudeUX"]');
+  assert.ok(navBtn, '界面增强 nav button injected into settings-sidebar');
+  navBtn.click();
+
+  const rightHost = h.doc.getElementById('settings-right-host');
+  const panel = h.doc.getElementById('ag-claude-ux-settings-panel');
+  assert.equal(rightHost.getAttribute('data-ag-claude-settings-open'), 'true');
+  assert.ok(panel && !panel.hidden, 'Claude UX settings panel visible');
+
+  const recentSwitch = panel.querySelector('[data-ag-cux-switch="claudeUxRecentSection"]');
+  assert.equal(recentSwitch.getAttribute('aria-checked'), 'true');
+  recentSwitch.click();
+  assert.equal(recentSwitch.getAttribute('aria-checked'), 'false');
+  assert.match(h.window.localStorage.getItem('ag_claude_ux_modules_v1') || '', /"claudeUxRecentSection":false/);
+
+  h.doc.querySelector('button[data-testid="settings-nav-item-General"]').click();
+  assert.equal(rightHost.hasAttribute('data-ag-claude-settings-open'), false, 'clicking native nav item restores native settings pane');
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});

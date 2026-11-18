@@ -19,7 +19,7 @@ const skip = JSDOM ? false : 'jsdom not installed';
 
 const SRC = fs
   .readFileSync(path.join(REPO, 'user', 'custom.js'), 'utf8')
-  .replace(/\}\)\(\);\s*$/, 'window.__t = { scheduleSync, syncStepStream, dispose }; })();');
+  .replace(/\}\)\(\);\s*$/, 'window.__t = { scheduleSync, syncStepStream, dispose, parseAndSlimMetricsPayload, cacheTierForRate }; })();');
 
 function mount(html, { modules = {} } = {}) {
   const dom = new JSDOM(`<!doctype html><body>${html}</body>`, {
@@ -706,6 +706,67 @@ test('native Settings -> 界面增强 panel: injects nav item, switches pane, an
 
   h.doc.querySelector('button[data-testid="settings-nav-item-General"]').click();
   assert.equal(rightHost.hasAttribute('data-ag-claude-settings-open'), false, 'clicking native nav item restores native settings pane');
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});
+
+test('metrics slimming: keeps outer TTFT pill, renders minimalist two-section popover with TTFT & tiered Cache %, and stays idempotent', { skip }, () => {
+  const h = mount(pane([]));
+  const { parseAndSlimMetricsPayload, cacheTierForRate } = h.window.__t;
+
+  assert.equal(cacheTierForRate(95.3), 'high');
+  assert.equal(cacheTierForRate(87.0), 'mid');
+  assert.equal(cacheTierForRate(80.0), 'low');
+
+  const mkPayload = ({ turns, cacheRate, sessCacheRate, hold = false }) => ({
+    cascadeId: 'abcd-1234',
+    hasData: true,
+    inlineHtml:
+      `<span>162 tok/s</span><span class="ag-sep">·</span><span>${hold ? 'Hold 1.8s' : 'TTFT 2.5s'}</span>` +
+      '<span class="ag-sep">·</span><span>Ctx 45k/512k <span class="">(9%)</span></span>' +
+      '<span class="ag-sep">·</span><span>Out 4.6k</span>' +
+      '<span class="ag-sep">·</span><span class="ag-sub-badge">+2 sub</span>',
+    tooltipHtml:
+      `<div class="ag-tt-hdr">本轮最新调用 (Gen #6)</div>` +
+      `<div class="ag-tt-row"><span class="ag-tt-lbl">生成速度</span><span class="ag-tt-val">${hold ? '端到端（含等待） 148.8 tok/s' : '流式 162.1 tok/s | 端到端（含等待） 148.8 tok/s'}</span></div>` +
+      `<div class="ag-tt-row"><span class="ag-tt-lbl">响应耗时</span><span class="ag-tt-val">${hold ? '等待 1.80s | 刷出 28.24s | 总计 30.04s' : 'TTFT 2.52s | 流式 28.24s | 总计 30.76s'}</span></div>` +
+      `<div class="ag-tt-row"><span class="ag-tt-lbl">当前上下文</span><span class="ag-tt-val">45,226 (新增 2,125 + 缓存 43,101, ${cacheRate}%)</span></div>` +
+      `<div class="ag-tt-row"><span class="ag-tt-lbl">本步输出量</span><span class="ag-tt-val">4,578 (思考链 3,064 + 正文/工具 1,514)</span></div>` +
+      `<div class="ag-tt-row"><span class="ag-tt-lbl">本轮合计 (6步)</span><span class="ag-tt-val">输出 11,365 (思考 5,964 + 响应 5,401) | 耗时 76.8s</span></div>` +
+      `<div class="ag-tt-hdr ag-tt-sec">当前会话累计 (${turns} 轮提问 / 6 次有效调用)</div>` +
+      `<div class="ag-tt-row"><span class="ag-tt-lbl">压缩水位线</span><span class="ag-tt-val">45k / 512k (9%) · 距压缩余 467k</span></div>` +
+      `<div class="ag-tt-row"><span class="ag-tt-lbl">累计输入量</span><span class="ag-tt-val">新增 48k + 缓存读取 186k (命中率 ${sessCacheRate}%)</span></div>` +
+      `<div class="ag-tt-row"><span class="ag-tt-lbl">累计输出量</span><span class="ag-tt-val">总计 28k (思考链 12k + 正文/工具 16k)</span></div>`
+  });
+
+  const slim1 = parseAndSlimMetricsPayload(mkPayload({ turns: 1, cacheRate: '95.3', sessCacheRate: '79.6' }));
+  assert.ok(slim1.inlineHtml.includes('TTFT 2.5s'), 'outer pill keeps TTFT');
+  assert.equal(slim1.inlineHtml.includes('Cache'), false, 'outer pill does not replace TTFT with Cache');
+  assert.equal(slim1.inlineHtml.includes('Ctx'), false);
+  assert.equal(slim1.inlineHtml.includes('Out'), false);
+  assert.equal(slim1.inlineHtml.includes('sub'), false);
+
+  assert.ok(slim1.tooltipHtml.includes('class="ag-ux-tt"'));
+  assert.ok(slim1.tooltipHtml.includes('本轮响应'));
+  assert.ok(slim1.tooltipHtml.includes('首字耗时') && slim1.tooltipHtml.includes('2.5s'));
+  assert.ok(slim1.tooltipHtml.includes('1m 17s'));
+  assert.ok(slim1.tooltipHtml.includes('11.4k'));
+  assert.ok(slim1.tooltipHtml.includes('当前会话'));
+  assert.ok(slim1.tooltipHtml.includes('data-cache-tier="high"'));
+  assert.equal(slim1.tooltipHtml.includes('Gen #6'), false);
+  assert.equal(slim1.tooltipHtml.includes('距压缩余'), false);
+  assert.equal(slim1.tooltipHtml.includes('累计输出'), false, 'turn 1 without subagent omits total output');
+
+  const replayed = parseAndSlimMetricsPayload(slim1);
+  assert.equal(replayed.inlineHtml, slim1.inlineHtml);
+  assert.equal(replayed.tooltipHtml, slim1.tooltipHtml);
+
+  const slimHold = parseAndSlimMetricsPayload(mkPayload({ turns: 3, cacheRate: '87.2', sessCacheRate: '82.1', hold: true }));
+  assert.ok(slimHold.inlineHtml.includes('Hold 1.8s'), 'outer pill keeps Hold on buffered run');
+  assert.ok(slimHold.tooltipHtml.includes('首包等待') && slimHold.tooltipHtml.includes('1.8s'));
+  assert.ok(slimHold.tooltipHtml.includes('data-cache-tier="mid"'));
+  assert.ok(slimHold.tooltipHtml.includes('累计输出') && slimHold.tooltipHtml.includes('28k'));
+
   h.cleanups.forEach((fn) => fn());
   h.close();
 });

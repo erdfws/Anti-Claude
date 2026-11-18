@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * antigravity-claude-ux — install.mjs
+ * Anti-Claude — install.mjs
  * Zero-dependency CLI installer, step-stream unlocker, auto-updater, doctor & uninstaller (Node.js >= 22)
  *
  * Commands:
@@ -61,7 +61,7 @@ const AG2_SYNC_SCRIPT = path.join(AGY_DIR, 'scripts', 'sync-antigravity-2.mjs');
 const UPSTREAM_REPO = 'https://github.com/Anarcadia/chuanban-antigravity-theme-patch.git';
 /* Verified upstream commit (v5.4.2). Bump deliberately after testing; override with CLAUDE_UX_UPSTREAM_REF=HEAD at your own risk. */
 const UPSTREAM_REF = process.env.CLAUDE_UX_UPSTREAM_REF || '6b3783d2a5104e863084adfffea1d61f95838ead';
-const SELF_REPO = 'https://github.com/hongqi7/antigravity-claude-ux.git';
+const SELF_REPO = 'https://github.com/hongqi7/Anti-Claude.git';
 const RULE_BEGIN = '<!-- BEGIN antigravity-claude-ux -->';
 const RULE_END = '<!-- END antigravity-claude-ux -->';
 const LEGACY_HEADING = '## 执行过程同步（Claude 式边做边汇报）';

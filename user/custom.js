@@ -1,5 +1,5 @@
 /**
- * antigravity-claude-ux — user/custom.js
+ * Anti-Claude — user/custom.js
  * Non-invasive runtime UX extension for Google Antigravity Desktop 2.0:
  * 1. Unfolds outer `worked-for-collapsible` end-of-turn wrapper so interleaved narration & tool summaries stay inline.
  * 2. Adds smooth 190ms collapse transition when React unmounts finished `tool-group-collapsible` panels.

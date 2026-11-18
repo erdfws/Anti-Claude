@@ -1,4 +1,4 @@
-# Antigravity Claude UX
+# Anti-Claude
 
 **Bring the exact macOS Claude Desktop (Code / Cowork) aesthetic, stratified model selector, live plan quota ring, in-bubble undo & edit, sidebar top Recents & collapsed folder status badges, in-app module switches, interleaved step narration, and in-flow live `TodoWrite` checklist cards to Google Antigravity Desktop 2.0 — 100% via non-invasive CDP runtime injection.**
 
@@ -70,7 +70,7 @@
 
 ### 方式一：让 AI 自动帮你装（最省心）
 直接把本仓库地址发给你的 Antigravity / Claude Code，说一句：
-> `帮我安装 https://github.com/hongqi7/antigravity-claude-ux`
+> `帮我安装 https://github.com/hongqi7/Anti-Claude`
 
 内置的 [`SKILL.md`](SKILL.md) 会引导 Agent 自动拉取最新 `main` 分支、同步字体、备份原配置并立即热注入生效。
 
@@ -78,8 +78,8 @@
 要求已安装 Node.js `>= 22`：
 
 ```bash
-git clone https://github.com/hongqi7/antigravity-claude-ux.git ~/Developer/antigravity-claude-ux
-node ~/Developer/antigravity-claude-ux/install.mjs install
+git clone https://github.com/hongqi7/Anti-Claude.git ~/Developer/Anti-Claude
+node ~/Developer/Anti-Claude/install.mjs install
 ```
 
 > **提示**：
@@ -89,17 +89,17 @@ node ~/Developer/antigravity-claude-ux/install.mjs install
 ### 常用诊断、手动同步与无损卸载
 ```bash
 # 检查各层健康状态
-node ~/Developer/antigravity-claude-ux/install.mjs doctor
+node ~/Developer/Anti-Claude/install.mjs doctor
 
 # 手动立即从 GitHub 拉取最新更新并重部署热生效
-node ~/Developer/antigravity-claude-ux/install.mjs sync-upgrade --force
+node ~/Developer/Anti-Claude/install.mjs sync-upgrade --force
 
 # 单独开启 / 关闭客户端更新自动跟随守护
-node ~/Developer/antigravity-claude-ux/install.mjs auto-update-on
-node ~/Developer/antigravity-claude-ux/install.mjs auto-update-off
+node ~/Developer/Anti-Claude/install.mjs auto-update-on
+node ~/Developer/Anti-Claude/install.mjs auto-update-off
 
 # 还原（移除更新守护、恢复原有 user/ 文件、回滚步骤开关、移除 AGENTS.md 规则块；重复执行为无操作）
-node ~/Developer/antigravity-claude-ux/install.mjs uninstall
+node ~/Developer/Anti-Claude/install.mjs uninstall
 ```
 
 安装选项：`--no-auto-update`、`--no-step-unlock`（不改步骤开关）、`--no-agents-rule`（不插入规则）、`--overwrite-local`。
@@ -167,7 +167,7 @@ node --test test/
 
 ## <a id="english-summary"></a>English Summary
 
-**Antigravity Claude UX** is a non-invasive customization and workflow suite for **Google Antigravity Desktop 2.0** (macOS / Windows) built as a user-space extension layer on top of [`Anarcadia/chuanban-antigravity-theme-patch`](https://github.com/Anarcadia/chuanban-antigravity-theme-patch):
+**Anti-Claude** is a non-invasive customization and workflow suite for **Google Antigravity Desktop 2.0** (macOS / Windows) built as a user-space extension layer on top of [`Anarcadia/chuanban-antigravity-theme-patch`](https://github.com/Anarcadia/chuanban-antigravity-theme-patch):
 
 - **Pixel-Matched `Claude.app` Visuals & Settings (`user/custom.css`)**: Pure `#FFFFFF` light canvas & `#212120` warm charcoal dark palette, unified `14px` sans-serif typography (`Anthropic Sans` + `PingFang SC`), clean single-layer `18px` composer with opaque `/` & `@` typeahead popups (plus `#ECECEA` dark send orb & `#383835` idle voice button, stripping `+sub` badge noise), and a pure-text Claude-styled Settings sidebar paired with Google official blue (`#2F75C3` / `#2F71E3`) controls and active orbiting step dots.
 - **Stratified Claude Model Menu, Live Plan Quota Ring & Minimalist Telemetry Popover (`user/custom.js`)**: Replaces the crowded 9-row flat model dropdown with a clean Claude-style popover featuring the 4 core Gemini models (`1–4` hotkeys) plus dedicated `Thinking Effort >` (`Low / Medium / High / XHigh`) and `More Models >` flyouts wired directly to Antigravity's native React Fiber `setSelectedModel`. Adds a radial context progress ring next to the model pill that opens a real-time `5h / weekly` plan quota popover via `retrieveUserQuotaSummary`, while pairing the clean outer `tok/s · TTFT` pill with a compact `272px` two-section telemetry popover (`本轮响应` with `TTFT` / speed / duration / output + `当前会话` with context & tiered cache hit rate, inspired by PR #2).

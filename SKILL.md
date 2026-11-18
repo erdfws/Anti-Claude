@@ -1,11 +1,11 @@
 ---
-name: antigravity-claude-ux
+name: anti-claude
 description: Deploy the 1:1 Claude Desktop (Code / Cowork) UI, typography, stratified model selector, live context & plan quota popover, in-bubble undo & edit, sidebar top Recents & collapsed folder badges, native Settings module switches, interleaved step stream, and in-flow live TodoWrite checklist card onto Google Antigravity Desktop 2.0 via non-invasive CDP runtime injection.
 ---
 
-# Antigravity Claude UX — Agent Auto-Deployment Skill
+# Anti-Claude — Agent Auto-Deployment Skill
 
-Only run these steps when the user **explicitly asks to install, update, or uninstall** `antigravity-claude-ux`. If the user only shares the URL or asks you to read, review, or evaluate the project, do **not** install anything.
+Only run these steps when the user **explicitly asks to install, update, or uninstall** `Anti-Claude`. If the user only shares the URL or asks you to read, review, or evaluate the project, do **not** install anything.
 
 The installer changes user config (theme-patch `user/` files, `product_skin`, `verboseConversationSteps`, a rule block in `~/.gemini/AGENTS.md`) and records every change for rollback. Tell the user this before running it.
 
@@ -16,13 +16,13 @@ The installer changes user config (theme-patch `user/` files, `product_skin`, `v
 ## 1-Step Installation (Fresh Install or Update to Latest)
 1. Clone this repository (or pull the latest `main` if already cloned) and run the installer:
    ```bash
-   if [ -d "$HOME/Developer/antigravity-claude-ux/.git" ]; then
-     git -C "$HOME/Developer/antigravity-claude-ux" pull --ff-only
+   if [ -d "$HOME/Developer/Anti-Claude/.git" ]; then
+     git -C "$HOME/Developer/Anti-Claude" pull --ff-only
    else
-     git clone https://github.com/hongqi7/antigravity-claude-ux.git "$HOME/Developer/antigravity-claude-ux"
+     git clone https://github.com/hongqi7/Anti-Claude.git "$HOME/Developer/Anti-Claude"
    fi
-   node "$HOME/Developer/antigravity-claude-ux/install.mjs" install
-   node "$HOME/Developer/antigravity-claude-ux/install.mjs" doctor
+   node "$HOME/Developer/Anti-Claude/install.mjs" install
+   node "$HOME/Developer/Anti-Claude/install.mjs" doctor
    ```
 2. What `node install.mjs install` automatically handles:
    - Installs upstream `Anarcadia/chuanban-antigravity-theme-patch` (`~/.gemini/antigravity/theme-patch`) if not yet present;
@@ -35,7 +35,7 @@ The installer changes user config (theme-patch `user/` files, `product_skin`, `v
 
 ## Clean Rollback
 ```bash
-node "$HOME/Developer/antigravity-claude-ux/install.mjs" uninstall
+node "$HOME/Developer/Anti-Claude/install.mjs" uninstall
 ```
 Removes the auto-update watcher, restores backed-up `theme-patch/user/` files (files that did not exist before are deleted; post-install edits are saved to a side folder first), reverts the step-stream settings it changed, removes the rule block from `~/.gemini/AGENTS.md`, and hot-reloads immediately. Running it twice is a no-op.
 

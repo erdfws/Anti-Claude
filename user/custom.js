@@ -998,7 +998,8 @@
 
   /* ==========================================================================
    * 5. Claude-Style Composer Context Ring + Live Plan Quota Popover + Slim Pill
-   *    - Strips `Ctx ...` & `Out ...` from center `#ag-live-metrics-pill` (keeps Speed + Time only)
+   *    - Strips `Ctx ...`, `Out ...`, `+N sub` & replaces `TTFT ...` with `Cache XX%`
+   *    - Simplifies `#ag-live-metrics-tooltip` into a clean, scannable Claude popover
    *    - Mounts radial context progress ring right beside the Model Selector
    *    - Clicking opens real-time Usage Popover (`retrieveUserQuotaSummary` 5h & weekly buckets)
    * ========================================================================== */
@@ -1017,12 +1018,205 @@
     return m ? m[1] : '';
   }
 
+  function fmtCompactTokens(n) {
+    if (!Number.isFinite(n) || n < 0) return '';
+    if (n < 1000) return String(Math.round(n));
+    const k = n / 1000;
+    return (k >= 100 ? String(Math.round(k)) : k.toFixed(1).replace(/\.0$/, '')) + 'k';
+  }
+
+  function fmtDurationSec(sec) {
+    if (!Number.isFinite(sec) || sec < 0) return '';
+    if (sec >= 60) {
+      const total = Math.round(sec);
+      const mins = Math.floor(total / 60);
+      const rem = total % 60;
+      return `${mins}m ${rem}s`;
+    }
+    return `${sec.toFixed(1)}s`;
+  }
+
+  function cacheTierForRate(rate) {
+    if (!Number.isFinite(rate)) return '';
+    const pct = Math.round(rate);
+    if (pct >= 90) return 'high';
+    if (pct >= 85) return 'mid';
+    return 'low';
+  }
+
+  function parseMetricsTooltipData(rawTooltip) {
+    if (!rawTooltip || typeof rawTooltip !== 'string') return null;
+    const tmp = document.createElement('div');
+    tmp.innerHTML = rawTooltip;
+    const data = {
+      streamTps: NaN,
+      isBuffered: false,
+      stepDur: NaN,
+      lastCacheRate: NaN,
+      stepOut: NaN,
+      turnSteps: 1,
+      turnOut: NaN,
+      turnDur: NaN,
+      sessionTurns: 1,
+      sessionCalls: 1,
+      ctxRatio: '',
+      ctxPct: '',
+      sessionCacheRate: NaN,
+      sessionTotalOut: '',
+      subLabel: '',
+      subSub: '',
+      warnHtml: ''
+    };
+
+    const secHdr = tmp.querySelector('.ag-tt-hdr.ag-tt-sec');
+    if (secHdr) {
+      const m = (secHdr.textContent || '').match(/(\d+)\s*轮提问\s*\/\s*(\d+)\s*次/);
+      if (m) {
+        data.sessionTurns = Number(m[1]) || 1;
+        data.sessionCalls = Number(m[2]) || 1;
+      }
+    }
+
+    tmp.querySelectorAll('.ag-tt-row').forEach((row) => {
+      const lbl = (row.querySelector('.ag-tt-lbl')?.textContent || '').trim();
+      const val = (row.querySelector('.ag-tt-val')?.textContent || '').trim();
+      if (!lbl) return;
+
+      if (lbl === '生成速度') {
+        const sm = val.match(/流式\s*([\d.]+)\s*tok\/s/i);
+        if (sm) {
+          data.streamTps = Number(sm[1]);
+          data.isBuffered = false;
+        } else {
+          const em = val.match(/([\d.]+)\s*tok\/s/i);
+          if (em) {
+            data.streamTps = Number(em[1]);
+            data.isBuffered = true;
+          }
+        }
+      } else if (lbl === '响应耗时') {
+        const tm = val.match(/总计\s*([\d.]+)s/i);
+        if (tm) data.stepDur = Number(tm[1]);
+      } else if (lbl === '当前上下文') {
+        const cm = val.match(/,\s*([\d.]+)%\)/);
+        if (cm) data.lastCacheRate = Number(cm[1]);
+      } else if (lbl === '本步输出量') {
+        const om = val.match(/^([\d,]+)/);
+        if (om) data.stepOut = Number(om[1].replace(/,/g, ''));
+      } else if (/^本轮合计/.test(lbl)) {
+        const sm = lbl.match(/\((\d+)\s*步\)/);
+        if (sm) data.turnSteps = Number(sm[1]) || 1;
+        const om = val.match(/^输出\s*([\d,]+)/);
+        if (om) data.turnOut = Number(om[1].replace(/,/g, ''));
+        const dm = val.match(/耗时\s*([\d.]+)s/i);
+        if (dm) data.turnDur = Number(dm[1]);
+      } else if (lbl === '压缩水位线') {
+        const wm = val.match(/^(.+?)\s*\((\d+%)\)/);
+        if (wm) {
+          data.ctxRatio = wm[1].trim();
+          data.ctxPct = wm[2];
+        }
+      } else if (lbl === '累计输入量') {
+        const hm = val.match(/命中率\s*([\d.]+)%/);
+        if (hm) data.sessionCacheRate = Number(hm[1]);
+      } else if (/^子\s*Agent/i.test(lbl)) {
+        const cm = lbl.match(/\((\d+)/);
+        const syncing = lbl.includes('同步中');
+        if (cm) {
+          data.subLabel = `+${cm[1]} 个`;
+          const outM = val.match(/输出\s*([^\s·]+)/);
+          if (outM) data.subSub = `输出 ${outM[1]}`;
+          else if (syncing) data.subSub = '同步中';
+        } else if (syncing) {
+          data.subLabel = '同步中';
+        }
+      } else if (lbl === '累计输出量') {
+        const om = val.match(/总计\s*([^\s(]+)/);
+        if (om) data.sessionTotalOut = om[1];
+      }
+    });
+
+    const warnEl = tmp.querySelector('.ag-tt-warn');
+    if (warnEl) data.warnHtml = warnEl.outerHTML;
+
+    if (!Number.isFinite(data.streamTps) && !data.ctxRatio) return null;
+    return data;
+  }
+
+  function buildSlimMetricsTooltipHtml(d, ctxFallback) {
+    const esc = (s) =>
+      String(s || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    const row = (lbl, valHtml) =>
+      `<div class="ag-ux-tt-row"><span class="ag-ux-tt-lbl">${esc(lbl)}</span><span class="ag-ux-tt-val">${valHtml}</span></div>`;
+
+    const steps = d.turnSteps > 1 ? d.turnSteps : 1;
+    const durVal = Number.isFinite(d.turnDur) ? d.turnDur : d.stepDur;
+    const outVal = Number.isFinite(d.turnOut) ? d.turnOut : d.stepOut;
+    const speedHtml = Number.isFinite(d.streamTps)
+      ? `${Math.round(d.streamTps)} tok/s${d.isBuffered ? '<span class="ag-ux-tt-sub">缓冲</span>' : ''}`
+      : '—';
+    const durHtml = fmtDurationSec(durVal) || '—';
+    const outHtml = fmtCompactTokens(outVal) || '—';
+
+    const ctxRatio = d.ctxRatio || ctxFallback.ratioText || '';
+    const ctxPct = d.ctxPct || (ctxFallback.hasData ? `${ctxFallback.pct}%` : '');
+    const ctxHtml = ctxRatio
+      ? `${esc(ctxRatio)}${ctxPct ? `<span class="ag-ux-tt-sub">${esc(ctxPct)}</span>` : ''}`
+      : '—';
+
+    const lastCache = Number.isFinite(d.lastCacheRate) ? `${Math.round(d.lastCacheRate)}%` : '';
+    const lastTier = cacheTierForRate(d.lastCacheRate);
+    const sessCache = Number.isFinite(d.sessionCacheRate) ? `${Math.round(d.sessionCacheRate)}%` : '';
+    const sessTier = cacheTierForRate(d.sessionCacheRate);
+    const cacheHtml = lastCache
+      ? `<span class="ag-ux-tt-cache" data-cache-tier="${lastTier}">${lastCache}</span>${sessCache ? `<span class="ag-ux-tt-sub">累计 ${sessCache}</span>` : ''}`
+      : sessCache
+        ? `<span class="ag-ux-tt-cache" data-cache-tier="${sessTier}">${sessCache}</span>`
+        : '—';
+
+    const sec1Rows = [
+      row('生成速度', speedHtml),
+      row('本轮耗时', durHtml),
+      row('本轮输出', outHtml)
+    ].join('');
+
+    const sec2List = [row('上下文', ctxHtml), row('缓存命中', cacheHtml)];
+    if (d.sessionTurns > 1 && d.sessionTotalOut) {
+      sec2List.push(row('累计输出', esc(d.sessionTotalOut)));
+    }
+    if (d.subLabel) {
+      sec2List.push(
+        row('子 Agent', `${esc(d.subLabel)}${d.subSub ? `<span class="ag-ux-tt-sub">${esc(d.subSub)}</span>` : ''}`)
+      );
+    }
+
+    return (
+      `<div class="ag-ux-tt">` +
+      `<div class="ag-ux-tt-sec">` +
+      `<div class="ag-ux-tt-hdr"><span class="ag-ux-tt-title">本轮响应</span><span class="ag-ux-tt-badge">${steps} 步</span></div>` +
+      sec1Rows +
+      `</div>` +
+      `<div class="ag-ux-tt-div"></div>` +
+      `<div class="ag-ux-tt-sec">` +
+      `<div class="ag-ux-tt-hdr"><span class="ag-ux-tt-title">当前会话</span><span class="ag-ux-tt-badge">${d.sessionTurns} 轮</span></div>` +
+      sec2List.join('') +
+      `</div>` +
+      (d.warnHtml || '') +
+      `</div>`
+    );
+  }
+
   function parseAndSlimMetricsPayload(payload) {
     if (!payload || typeof payload !== 'object') return payload;
     const rawInline = payload.__agOrigInlineHtml || payload.inlineHtml || '';
+    const rawTooltip = payload.__agOrigTooltipHtml || payload.tooltipHtml || '';
     const curCid = getActiveCascadeId();
 
     if (payload.hasData && rawInline && (!curCid || payload.cascadeId === curCid)) {
+      const parsedTt = parseMetricsTooltipData(rawTooltip);
       const tmp = document.createElement('div');
       tmp.innerHTML = rawInline;
       let ratioText = '';
@@ -1051,6 +1245,11 @@
           const prev = el.previousElementSibling;
           if (prev && prev.classList.contains('ag-sep')) prev.remove();
           el.remove();
+        } else if (/^(?:TTFT|Hold)\b/i.test(txt) && parsedTt && Number.isFinite(parsedTt.lastCacheRate)) {
+          const tier = cacheTierForRate(parsedTt.lastCacheRate);
+          el.className = 'ag-cache-pill';
+          if (tier) el.setAttribute('data-cache-tier', tier);
+          el.textContent = `Cache ${Math.round(parsedTt.lastCacheRate)}%`;
         }
       }
       while (tmp.firstElementChild && tmp.firstElementChild.classList.contains('ag-sep')) {
@@ -1065,9 +1264,12 @@
         cascadeId: payload.cascadeId || curCid
       };
 
+      const nextTooltipHtml = parsedTt ? buildSlimMetricsTooltipHtml(parsedTt, latestCtxState) : rawTooltip;
       const slimmed = Object.assign({}, payload, {
         __agOrigInlineHtml: rawInline,
-        inlineHtml: tmp.innerHTML
+        __agOrigTooltipHtml: rawTooltip,
+        inlineHtml: tmp.innerHTML,
+        tooltipHtml: nextTooltipHtml
       });
       return slimmed;
     }
@@ -1092,6 +1294,9 @@
       const ret = origRenderMetrics.call(this, slimPayload);
       if (payload && payload.__agOrigInlineHtml === undefined && window.__ag_last_metrics === slimPayload) {
         window.__ag_last_metrics.__agOrigInlineHtml = payload.inlineHtml;
+      }
+      if (payload && payload.__agOrigTooltipHtml === undefined && window.__ag_last_metrics === slimPayload) {
+        window.__ag_last_metrics.__agOrigTooltipHtml = payload.tooltipHtml;
       }
       updateComposerRingVisuals();
       if (quotaPopoverOpen) renderQuotaPopoverBody();

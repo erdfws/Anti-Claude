@@ -564,33 +564,124 @@
     return todoProgress(next) > todoProgress(items) ? next : items;
   }
 
+  const sliceStepSeen = new WeakSet();
+  const paneSliceActiveOrigins = new WeakMap();
+
+  function sliceStepsFromBranch(f) {
+    const ts = f && f.memoizedProps && f.memoizedProps.trajectorySlice;
+    return ts && Array.isArray(ts.stepsInSlice) ? ts.stepsInSlice : null;
+  }
+
+  function harvestPaneSliceOrigins(pane) {
+    if (!pane || !pane.root) return;
+    const vp = pane.root.querySelector('[data-testid="autoscroll-viewport"]');
+    if (!vp) return;
+    const fk = Object.keys(vp).find((k) => k.startsWith('__reactFiber$'));
+    let f = fk ? vp[fk] : null;
+    let sliceSteps = null;
+    for (let i = 0; i < 12 && f; i++, f = f.return) {
+      const a = sliceStepsFromBranch(f);
+      const b = sliceStepsFromBranch(f.alternate);
+      const pick = (b ? b.length : 0) > (a ? a.length : 0) ? b : a;
+      if (pick && pick.length) {
+        sliceSteps = pick;
+        break;
+      }
+    }
+    if (!sliceSteps) return;
+    let origins = paneSliceActiveOrigins.get(pane.root);
+    if (!origins) {
+      origins = new Map();
+      paneSliceActiveOrigins.set(pane.root, origins);
+    }
+    for (let i = 0; i < sliceSteps.length; i++) {
+      const s = sliceSteps[i];
+      const v = s && s.step && s.step.case === 'plannerResponse' ? s.step.value : null;
+      if (!v || typeof v !== 'object' || sliceStepSeen.has(v)) continue;
+      const text = v.modifiedResponse || v.response || '';
+      if (!text) continue;
+      sliceStepSeen.add(v);
+      for (const items of extractTaskLists(text)) {
+        if (hasActiveTodo(items)) {
+          origins.set(todoSignature(items), items);
+        }
+      }
+    }
+  }
+
+  function paneHasSliceActiveOrigin(pane, items) {
+    const origins = pane && paneSliceActiveOrigins.get(pane.root);
+    if (!origins || !items) return false;
+    for (const originItems of origins.values()) {
+      if (isChecklistEvolution(originItems, items)) return true;
+    }
+    return false;
+  }
+
   function turnHasActiveTodoOrigin(turnEl, items) {
-    const mem = turnEl && turnTodoMemory.get(turnEl);
-    if (!mem || !items) return false;
+    if (!turnEl || !items) return false;
+    const mem = turnTodoMemory.get(turnEl);
+    if (!mem) return false;
     for (const rec of mem.values()) {
       if (hasActiveTodo(rec.items) && isChecklistEvolution(rec.items, items)) return true;
     }
     return false;
   }
 
-  /*
-   * In Knowledge Work (`PRODUCT_SKIN_NON_TECHNICAL`), mid-turn planner steps are collapsed inside
-   * `progress-updates-collapsible` without mounting `<ul class="contains-task-list">`, leaving only the final
-   * all-`[x]` `<ul>` in the DOM. Check `turnTodoMemory` (populated from `container.steps`) on `turnEl` and
-   * preceding turns in the same pane so execution checklists still render as `.ag-claude-todo-card` while
-   * ordinary `[ ] / [x]` answer checklists (which never had an `[/]` step) stay untouched.
-   */
-  function findStepActiveOriginTurns(paneTurns, turnEl, items) {
-    if (!turnEl || !items) return [];
-    if (turnHasActiveTodoOrigin(turnEl, items)) return [turnEl];
-    if (!paneTurns || !paneTurns.length) return [];
-    const endIdx = paneTurns.indexOf(turnEl);
-    const upper = endIdx >= 0 ? endIdx : paneTurns.length;
-    for (let i = upper - 1; i >= 0; i--) {
-      const prevTurn = paneTurns[i];
-      if (turnHasActiveTodoOrigin(prevTurn, items)) return [prevTurn, turnEl];
+  function turnHasUnclaimedProgressMarker(turnEl, total) {
+    const byTotal = turnEl && turnProgressByTotal.get(turnEl);
+    if (!byTotal || !byTotal.has(total)) return false;
+    const mem = turnTodoMemory.get(turnEl);
+    if (!mem) return true;
+    for (const rec of mem.values()) {
+      if (rec.items.length === total && isAllTodoCompleted(rec.items)) return false;
     }
-    return [];
+    return true;
+  }
+
+  /*
+   * When mid-turn planner steps are collapsed (`worked-for-collapsible` / `progress-updates-collapsible`) or
+   * earlier turns in a multi-turn task are virtual-scroll unmounted by `autoscroll-viewport` (`v2.33.0+`),
+   * only the final all-`[x]` `<ul>` may be mounted in the DOM. Check:
+   *  1) `turnTodoMemory` (`[/]` evolution) or own `<!-- todo:N/M -->` marker on `turnEl`;
+   *  2) preceding mounted `paneTurns` (`[/]` evolution, or an unclaimed `<!-- todo:N/M -->` sub-turn not yet closed);
+   *  3) unmounted `[/]` origins in `trajectorySlice.stepsInSlice` on `autoscroll-viewport`.
+   * Ordinary `[ ] / [x]` answer checklists (which never had an `[/]` step or `<!-- todo:N/M -->`) stay untouched.
+   */
+  function findStepActiveOriginTurns(pane, paneTurns, turnEl, items) {
+    if (!items) return { matched: false, turns: [] };
+    if (turnEl) {
+      const ownMarkers = turnProgressByTotal.get(turnEl);
+      if ((ownMarkers && ownMarkers.has(items.length)) || turnHasActiveTodoOrigin(turnEl, items)) {
+        return { matched: true, turns: [turnEl] };
+      }
+    }
+    if (paneTurns && paneTurns.length) {
+      const endIdx = turnEl ? paneTurns.indexOf(turnEl) : -1;
+      const upper = endIdx >= 0 ? endIdx : paneTurns.length;
+      let seenInterveningCompletedSameLen = false;
+      for (let i = upper - 1; i >= 0; i--) {
+        const prevTurn = paneTurns[i];
+        if (turnHasActiveTodoOrigin(prevTurn, items)) {
+          return { matched: true, turns: turnEl ? [prevTurn, turnEl] : [prevTurn] };
+        }
+        if (!seenInterveningCompletedSameLen && turnHasUnclaimedProgressMarker(prevTurn, items.length)) {
+          return { matched: true, turns: turnEl ? [prevTurn, turnEl] : [prevTurn] };
+        }
+        const prevMem = turnTodoMemory.get(prevTurn);
+        if (prevMem) {
+          for (const rec of prevMem.values()) {
+            if (rec.items.length === items.length && isAllTodoCompleted(rec.items)) {
+              seenInterveningCompletedSameLen = true;
+            }
+          }
+        }
+      }
+    }
+    if (pane && paneHasSliceActiveOrigin(pane, items)) {
+      return { matched: true, turns: turnEl ? [turnEl] : [] };
+    }
+    return { matched: false, turns: [] };
   }
 
   function bestRememberedInTurn(turnEl) {
@@ -626,6 +717,7 @@
         const paneLive = isPaneActivelyGenerating(pane);
         const paneTurns = Array.from(pane.root.querySelectorAll('[data-testid="agent-response"]'));
         const latestPaneTurn = paneTurns.length ? paneTurns[paneTurns.length - 1] : null;
+        harvestPaneSliceOrigins(pane);
         for (const tEl of paneTurns) {
           harvestStepChecklists(tEl, paneLive && tEl === latestPaneTurn);
         }
@@ -680,17 +772,15 @@
               if (!last.turnEls.includes(entry.turnEl)) last.turnEls.push(entry.turnEl);
             }
           } else {
-            const originTurns = active
-              ? entry.turnEl
-                ? [entry.turnEl]
-                : []
-              : findStepActiveOriginTurns(paneTurns, entry.turnEl, entry.items);
-            if (active || originTurns.length > 0) {
+            const origin = active
+              ? { matched: true, turns: entry.turnEl ? [entry.turnEl] : [] }
+              : findStepActiveOriginTurns(group.pane, paneTurns, entry.turnEl, entry.items);
+            if (origin.matched) {
               clusters.push({
                 lists: [entry.ul],
                 items: entry.items,
                 lastTurnEl: entry.turnEl || null,
-                turnEls: originTurns.length ? originTurns : entry.turnEl ? [entry.turnEl] : []
+                turnEls: origin.turns.length ? origin.turns : entry.turnEl ? [entry.turnEl] : []
               });
             }
           }

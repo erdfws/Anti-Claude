@@ -432,3 +432,75 @@ test('Knowledge Work mode live turn: mounts live dock card from container.steps 
   h.cleanups.forEach((fn) => fn());
   h.close();
 });
+
+test('v2.33+ virtualized scroll: follow-up turn with <!-- todo:N/M --> + all-[x] <ul> renders card even when opening [/] turn is unmounted', { skip }, async () => {
+  const h = mount(
+    pane([
+      ul(li('检查版本与日志', 'completed'), li('修复调试端口守护', 'completed'), li('实机校验自愈状态', 'completed')),
+      ul(li('普通附件核对一', 'completed'), li('普通附件核对二', 'completed'), li('普通附件核对三', 'completed'))
+    ])
+  );
+  const turns = h.doc.querySelectorAll('[data-testid="agent-response"]');
+  turns[0].__reactFiber$t = {
+    memoizedProps: {},
+    return: {
+      memoizedProps: {
+        container: {
+          steps: [
+            { step: { case: 'plannerResponse', value: { response: '开始第三阶段校验。<!-- todo:3/3 -->' } } },
+            {
+              step: {
+                case: 'plannerResponse',
+                value: { response: '- [x] 检查版本与日志\n- [x] 修复调试端口守护\n- [x] 实机校验自愈状态' }
+              }
+            }
+          ]
+        }
+      }
+    }
+  };
+  turns[0].appendChild(h.doc.createElement('span'));
+  await settle(h);
+
+  const cards = h.doc.querySelectorAll('.ag-claude-todo-card');
+  assert.equal(cards.length, 1, 'follow-up turn with matching <!-- todo:3/3 --> becomes a bordered TodoWrite card');
+  assert.equal(turns[0].querySelector('ul').getAttribute('data-ag-todo-primary'), 'true');
+  assert.equal(turns[1].querySelector('ul').hasAttribute('data-ag-todo-primary'), false, 'ordinary all-[x] list without todo marker stays native');
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});
+
+test('v2.33+ trajectorySlice.stepsInSlice: recovers [/] origin when earlier turn DOM node was virtual-scroll unmounted', { skip }, async () => {
+  const h = mount(
+    pane([
+      `<div data-testid="autoscroll-viewport"></div>`,
+      ul(li('拉取补丁源码', 'completed'), li('验证热重载', 'completed'), li('推送远端仓库', 'completed'))
+    ])
+  );
+  const vp = h.doc.querySelector('[data-testid="autoscroll-viewport"]');
+  vp.__reactFiber$vp = {
+    memoizedProps: {},
+    return: {
+      memoizedProps: {
+        trajectorySlice: {
+          stepsInSlice: [
+            {
+              step: {
+                case: 'plannerResponse',
+                value: { response: '- [/] 拉取补丁源码\n- [ ] 验证热重载\n- [ ] 推送远端仓库' }
+              }
+            }
+          ]
+        }
+      }
+    }
+  };
+  const turns = h.doc.querySelectorAll('[data-testid="agent-response"]');
+  turns[1].appendChild(h.doc.createElement('span'));
+  await settle(h);
+
+  const cards = h.doc.querySelectorAll('.ag-claude-todo-card');
+  assert.equal(cards.length, 1, 'final all-[x] list inherits [/] origin from trajectorySlice.stepsInSlice');
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});

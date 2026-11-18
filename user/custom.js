@@ -164,12 +164,13 @@
   }
 
   function parseTodoUlUncached(ul) {
-    const lis = Array.from(ul.children).filter((el) => el.tagName === 'LI' && el.classList.contains('task-list-item'));
-    if (lis.length < 2 || lis.length > 15) return null;
+    const allLis = Array.from(ul.children).filter((el) => el.tagName === 'LI');
+    const lis = allLis.filter((el) => el.classList.contains('task-list-item'));
+    if (lis.length < 2 || lis.length > 15 || lis.length !== allLis.length) return null;
 
     const items = [];
     for (const li of lis) {
-      const iconBox = li.querySelector(':scope > div:first-child');
+      const iconBox = li.querySelector(':scope > div:first-child, :scope > p:first-child > div:first-child');
       let status = 'pending';
       if (li.classList.contains('task-checked')) {
         status = 'completed';
@@ -177,9 +178,9 @@
         status = 'in_progress';
       }
       const clone = li.cloneNode(true);
-      const firstDiv = clone.querySelector(':scope > div:first-child');
+      const firstDiv = clone.querySelector(':scope > div:first-child, :scope > p:first-child > div:first-child');
       if (firstDiv) firstDiv.remove();
-      const checkedSpan = clone.querySelector(':scope > span.task-checked-content');
+      const checkedSpan = clone.querySelector(':scope > span.task-checked-content, :scope > p > span.task-checked-content');
       const labelHtml = (checkedSpan ? checkedSpan.innerHTML : clone.innerHTML).trim();
       if (!labelHtml) return null;
       items.push({ status, html: labelHtml });
@@ -520,6 +521,19 @@
     return best;
   }
 
+  function turnContinuesChecklist(turnEl, baseItems) {
+    if (!turnEl || !baseItems || !baseItems.length) return false;
+    const mem = turnTodoMemory.get(turnEl);
+    if (mem && mem.size > 0) {
+      for (const rec of mem.values()) {
+        if (isChecklistEvolution(baseItems, rec.items)) return true;
+      }
+      return false;
+    }
+    const byTotal = turnProgressByTotal.get(turnEl);
+    return Boolean(byTotal && byTotal.has(baseItems.length));
+  }
+
   function recordProgressMarker(turnEl, total, n) {
     if (!turnEl || !(n >= 1 && total >= n && total <= 15)) return false;
     let byTotal = turnProgressByTotal.get(turnEl);
@@ -719,6 +733,19 @@
     return best;
   }
 
+  function turnContinuesChecklist(turnEl, baseItems) {
+    if (!turnEl || !baseItems || !baseItems.length) return false;
+    const mem = turnTodoMemory.get(turnEl);
+    if (mem && mem.size > 0) {
+      for (const rec of mem.values()) {
+        if (isChecklistEvolution(baseItems, rec.items)) return true;
+      }
+      return false;
+    }
+    const byTotal = turnProgressByTotal.get(turnEl);
+    return Boolean(byTotal && byTotal.has(baseItems.length));
+  }
+
   /**
    * Only *execution-progress* checklists are taken over:
    *  - a cluster starts with a list containing an active `[/]` item (either mounted in DOM or recorded in
@@ -814,20 +841,25 @@
           const cluster = clusters[i];
           for (const ul of cluster.lists) touched.add(ul);
 
-          /* Relay: if a follow-up live turn continues an incomplete checklist without re-emitting <ul>, attach latestPaneTurn */
+          /* Only relay a prior incomplete checklist into latestPaneTurn when latestPaneTurn itself signals
+             continuation (`<!-- todo:N/M -->` or an evolved checklist), preventing old cards from resurrecting on fresh prompts */
           const isLastCluster = i === clusters.length - 1;
-          const canRelayToLatestTurn =
+          const relayedIntoLatest =
             paneLive &&
             isLastCluster &&
             Boolean(latestPaneTurn) &&
-            !isAllTodoCompleted(cluster.items);
+            cluster.lastTurnEl !== latestPaneTurn &&
+            !isAllTodoCompleted(cluster.items) &&
+            turnContinuesChecklist(latestPaneTurn, cluster.items);
           const candidateTurns =
-            canRelayToLatestTurn && !cluster.turnEls.includes(latestPaneTurn)
+            relayedIntoLatest && !cluster.turnEls.includes(latestPaneTurn)
               ? [...cluster.turnEls, latestPaneTurn]
               : cluster.turnEls;
 
-          /* Antigravity unmounts off-screen steps: check remembered lists across all turns in the cluster */
-          for (const tEl of candidateTurns) {
+          /* Scan forward across mounted turns in case a later step / split turn recorded an all-[x] completion */
+          const firstTurnIdx = paneTurns && cluster.turnEls.length ? paneTurns.indexOf(cluster.turnEls[0]) : -1;
+          const memoryScanTurns = paneTurns && firstTurnIdx >= 0 ? paneTurns.slice(firstTurnIdx) : candidateTurns;
+          for (const tEl of memoryScanTurns) {
             const remembered = latestRememberedTodo(tEl, cluster.items);
             if (remembered) cluster.items = remembered;
           }
@@ -837,7 +869,7 @@
             paneLive &&
             isLastCluster &&
             Boolean(latestPaneTurn) &&
-            (cluster.lastTurnEl === latestPaneTurn || !isAllTodoCompleted(cluster.items));
+            (cluster.lastTurnEl === latestPaneTurn || relayedIntoLatest);
           const mountedDock = isDockedLiveCluster ? renderLiveDockedTodoCard(latestPaneTurn, cluster.items) : null;
 
           if (mountedDock) {
@@ -863,7 +895,11 @@
         if (!best && paneTurns.length >= 2) {
           const prevTurn = paneTurns[paneTurns.length - 2];
           const prevBest = bestRememberedInTurn(prevTurn);
-          if (prevBest && !isAllTodoCompleted(prevBest.items)) {
+          if (
+            prevBest &&
+            !isAllTodoCompleted(prevBest.items) &&
+            turnContinuesChecklist(latestPaneTurn, prevBest.items)
+          ) {
             best = prevBest;
             turnScope = [prevTurn, latestPaneTurn];
           }
@@ -2944,12 +2980,45 @@
     return 'bell';
   }
 
+  function isSidebarVisibleSummary(id, summary, state) {
+    if (!id || !summary) return false;
+    if (summary.annotations && summary.annotations.archived) return false;
+    if (summary.trajectoryMetadata && summary.trajectoryMetadata.parentConversationId) return false;
+    if (summary.trajectoryMetadata && summary.trajectoryMetadata.isBattleModeFork) return false;
+    if (
+      summary.trajectoryMetadata &&
+      summary.trajectoryMetadata.sourceMetadata &&
+      summary.trajectoryMetadata.sourceMetadata.hideFromConversationList
+    ) {
+      return false;
+    }
+    if (SIDEBAR_IGNORED_TYPES.has(summary.trajectoryType)) return false;
+    const idxSidebar =
+      state && state.trajectorySummaries && state.trajectorySummaries.indexes && state.trajectorySummaries.indexes.sidebar;
+    if (idxSidebar) {
+      if (typeof idxSidebar.has === 'function') {
+        if (idxSidebar.size > 0 && !idxSidebar.has(id)) return false;
+      } else if (typeof idxSidebar === 'object') {
+        const keys = Object.keys(idxSidebar);
+        if (keys.length > 0 && !Object.prototype.hasOwnProperty.call(idxSidebar, id)) return false;
+      }
+    }
+    return true;
+  }
+
+  function isSummaryPinned(id, summary, state) {
+    if (summary && summary.annotations && summary.annotations.pinned) return true;
+    const idxPinned =
+      state && state.trajectorySummaries && state.trajectorySummaries.indexes && state.trajectorySummaries.indexes.pinned;
+    if (idxPinned) {
+      if (typeof idxPinned.has === 'function') return idxPinned.has(id);
+      if (typeof idxPinned === 'object') return Object.prototype.hasOwnProperty.call(idxPinned, id);
+    }
+    return false;
+  }
+
   function classifySidebarConversation(id, summary, state, activeId, hasFocus) {
-    if (!id || !summary) return null;
-    if (summary.annotations && summary.annotations.archived) return null;
-    if (summary.trajectoryMetadata && summary.trajectoryMetadata.parentConversationId) return null;
-    if (summary.trajectoryMetadata && summary.trajectoryMetadata.isBattleModeFork) return null;
-    if (SIDEBAR_IGNORED_TYPES.has(summary.trajectoryType)) return null;
+    if (!isSidebarVisibleSummary(id, summary, state)) return null;
 
     const summaries = (state && state.trajectorySummaries && state.trajectorySummaries.summaries) || {};
     const byParent = state && state.trajectorySummaries && state.trajectorySummaries.indexes && state.trajectorySummaries.indexes.byParent;
@@ -3252,10 +3321,8 @@
     const summaries = (state && state.trajectorySummaries && state.trajectorySummaries.summaries) || {};
     const list = [];
     for (const [id, summary] of Object.entries(summaries)) {
-      if (!summary || (summary.annotations && summary.annotations.archived)) continue;
-      if (summary.trajectoryMetadata && summary.trajectoryMetadata.parentConversationId) continue;
-      if (summary.trajectoryMetadata && summary.trajectoryMetadata.isBattleModeFork) continue;
-      if (SIDEBAR_IGNORED_TYPES.has(summary.trajectoryType)) continue;
+      if (!isSidebarVisibleSummary(id, summary, state)) continue;
+      if (isSummaryPinned(id, summary, state)) continue;
       const title = (summary.annotations && summary.annotations.title) || summary.summary;
       if (!title) continue;
       const updatedAt = Math.max(protoSeconds(summary.lastModifiedTime), protoSeconds(summary.createdTime));
@@ -3337,14 +3404,12 @@
             } else if (it.status && it.status.kind === 'unread') {
               sideHtml = `<span class="ag-claude-unread-dot"></span>${age ? `<span>${escapeHtml(age)}</span>` : ''}`;
             }
-            const projHtml = it.project ? `<div class="ag-recent-proj">${escapeHtml(it.project)}</div>` : '';
-            return `<button type="button" class="ag-recent-row" data-ag-recent-id="${escapeHtml(it.id)}" data-active="${isAct ? 'true' : 'false'}"><div class="ag-recent-main"><div class="ag-recent-title">${escapeHtml(it.title)}</div>${projHtml}</div><div class="ag-recent-side">${sideHtml}</div></button>`;
+            const tip = it.project ? `${it.title}\n所属项目：${it.project}` : it.title;
+            return `<button type="button" class="ag-recent-row" data-ag-recent-id="${escapeHtml(it.id)}" data-active="${isAct ? 'true' : 'false'}" title="${escapeHtml(tip)}"><div class="ag-recent-main"><div class="ag-recent-title">${escapeHtml(it.title)}</div></div><div class="ag-recent-side">${sideHtml}</div></button>`;
           })
           .join('')}</div>` +
         (total > 4
-          ? `<button type="button" class="ag-recent-more" data-ag-recent-more>${
-              recentExpanded ? '收起至 4 条' : `展开更多 (${Math.min(8, total)})`
-            }</button>`
+          ? `<button type="button" class="ag-recent-more" data-ag-recent-more>${recentExpanded ? '收起' : '展开更多'}</button>`
           : '');
 
     sec.innerHTML = `<button type="button" class="ag-recent-hdr" data-ag-recent-toggle aria-expanded="${!recentCollapsed}"><span>最近对话</span><span class="ag-recent-chevron">▾</span></button>${rowsHtml}`;
@@ -3416,7 +3481,7 @@
       items: [
         ['claudeUxInlineUndo', 'inlineUndo', '原地撤回重编消息', '点击撤回时在原气泡直接展开编辑框，支持变更文件还原预览与原附件保留'],
         ['claudeUxFolderStatus', 'folderStatus', '折叠项目状态聚合角标', '项目文件夹折叠时在右侧安静汇总待审批、运行中与已完成未读状态'],
-        ['claudeUxRecentSection', 'recentSection', '侧边栏顶部最近对话', '在侧边栏顶部按活跃优先级展示最近会话，支持跨项目无刷秒切与收起']
+        ['claudeUxRecentSection', 'recentSection', '侧边栏顶部最近对话', '在侧边栏顶部按活跃优先级展示非置顶最近会话，支持跨项目无刷秒切与收起']
       ]
     }
   ];

@@ -627,6 +627,24 @@ test('sidebar folder status badges & top Recents: aggregates collapsed folders, 
           trajectoryMetadata: { projectId: 'proj-a' },
           waitingSteps: [{ metadata: { toolCall: { name: 'run_command' } } }],
           status: 2
+        },
+        'conv-hidden-ocr': {
+          summary: '你是高精度文档转录器。把这一页扫描件逐字转录为 Markdown：',
+          lastModifiedTime: { seconds: nowSec - 180 },
+          trajectoryMetadata: { projectId: 'proj-a', sourceMetadata: { hideFromConversationList: true } },
+          status: 1
+        },
+        'conv-hidden-workflow': {
+          summary: '后台批处理 workflow',
+          lastModifiedTime: { seconds: nowSec - 120 },
+          trajectoryMetadata: { projectId: 'proj-b', sourceMetadata: { hideFromConversationList: true } },
+          status: 1
+        },
+        'conv-pinned': {
+          annotations: { title: '已置顶高频会话', pinned: true },
+          lastModifiedTime: { seconds: nowSec - 10 },
+          trajectoryMetadata: { projectId: 'outside-of-project' },
+          status: 1
         }
       }
     }
@@ -642,8 +660,8 @@ test('sidebar folder status badges & top Recents: aggregates collapsed folders, 
         }
       },
       sidebarGroups: [
-        { id: 'proj-a', label: '项目A', conversationIds: ['conv-idle-unread', 'conv-pending'] },
-        { id: 'proj-b', label: '项目B', conversationIds: ['conv-running'] }
+        { id: 'proj-a', label: '项目A', conversationIds: ['conv-idle-unread', 'conv-pending', 'conv-hidden-ocr'] },
+        { id: 'proj-b', label: '项目B', conversationIds: ['conv-running', 'conv-hidden-workflow'] }
       ]
     }
   };
@@ -656,6 +674,7 @@ test('sidebar folder status badges & top Recents: aggregates collapsed folders, 
   assert.equal(badgesA.length, 2, 'collapsed proj-a renders pending + unread badges');
   assert.equal(badgesA[0].getAttribute('data-kind'), 'pending');
   assert.equal(badgesA[1].getAttribute('data-kind'), 'unread');
+  assert.equal(badgesA[1].textContent.trim(), '1', 'hidden hideFromConversationList sessions do not count as ghost unread');
   assert.equal(badgesB.length, 0, 'expanded proj-b suppresses folder badges');
 
   const recentRows = h.doc.querySelectorAll('#ag-claude-recent-section .ag-recent-row');
@@ -663,8 +682,10 @@ test('sidebar folder status badges & top Recents: aggregates collapsed folders, 
   assert.deepEqual(
     Array.from(recentRows).map((r) => r.getAttribute('data-ag-recent-id')),
     ['conv-pending', 'conv-running', 'conv-idle-unread'],
-    'sorted by pending > running > recent'
+    'sorted by pending > running > recent and excludes hidden workflow & already-pinned sessions'
   );
+  assert.equal(h.doc.querySelectorAll('#ag-claude-recent-section .ag-recent-proj').length, 0, 'Variant A uses pure single-line rows');
+  assert.match(recentRows[1].getAttribute('title') || '', /所属项目：项目B/, 'hover title exposes project name');
   recentRows[1].click();
   assert.deepEqual(JSON.parse(JSON.stringify(navigatedTo)), { to: '/c/$cascadeId', params: { cascadeId: 'conv-running' } });
   h.cleanups.forEach((fn) => fn());
@@ -767,6 +788,56 @@ test('metrics slimming: keeps outer TTFT pill, renders minimalist two-section po
   assert.ok(slimHold.tooltipHtml.includes('data-cache-tier="mid"'));
   assert.ok(slimHold.tooltipHtml.includes('累计输出') && slimHold.tooltipHtml.includes('28k'));
 
+  h.cleanups.forEach((fn) => fn());
+  h.close();
+});
+
+test('historical incomplete or split-turn checklist never resurrects into an unrelated new live turn', { skip }, async () => {
+  const h = mount(
+    pane(
+      [
+        ul(li('排查发虚根因', 'in_progress'), li('修复设置侧栏'), li('融合遥测浮窗'), li('同步仓库提交')),
+        '<p>异步任务汇总结果</p>',
+        '<p>正在思考新问题</p>'
+      ],
+      { generating: true }
+    )
+  );
+  const turns = h.doc.querySelectorAll('[data-testid="agent-response"]');
+  turns[2].__reactFiber$t = {
+    memoizedProps: { container: { steps: [{ step: { case: 'plannerResponse', value: { response: '正在思考新问题' } } }] } }
+  };
+  await settle(h);
+
+  assert.equal(h.doc.querySelector('[data-ag-todo-dock]'), null, 'must never hijack an unrelated new live turn');
+  const card = h.doc.querySelector('[data-ag-todo-mount]');
+  assert.ok(card && card.getAttribute('data-ag-todo-paused') === 'true', 'historical incomplete card stays paused in place');
+
+  /* Next sub-turn completes the checklist right after plain bullets in markdown */
+  turns[1].__reactFiber$t = {
+    memoizedProps: {
+      container: {
+        steps: [
+          {
+            step: {
+              case: 'plannerResponse',
+              value: {
+                response:
+                  '- 说明文字一行\n- 说明文字二行\n- [x] 排查发虚根因\n- [x] 修复设置侧栏\n- [x] 融合遥测浮窗\n- [x] 同步仓库提交'
+              }
+            }
+          }
+        ]
+      }
+    }
+  };
+  turns[1].appendChild(h.doc.createElement('span'));
+  await settle(h);
+
+  assert.equal(h.doc.querySelector('[data-ag-todo-dock]'), null, 'live dock still stays unmounted on unrelated Turn 2');
+  const statuses = Array.from(card.querySelectorAll('.ag-claude-todo-row')).map((r) => r.getAttribute('data-status'));
+  assert.deepEqual(statuses, ['completed', 'completed', 'completed', 'completed'], 'upgrades historical card via forward step scan');
+  assert.equal(card.hasAttribute('data-ag-todo-paused'), false);
   h.cleanups.forEach((fn) => fn());
   h.close();
 });

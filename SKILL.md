@@ -10,7 +10,7 @@ Only run these steps when the user **explicitly asks to install, update, or unin
 The installer changes user config (theme-patch `user/` files, `product_skin`, `verboseConversationSteps`, a rule block in `~/.gemini/AGENTS.md`) and records every change for rollback. Tell the user this before running it.
 
 ## Prerequisites
-- Google Antigravity Desktop 2.0 (`v2.30+`, tested through `v2.32.2`) on macOS or Windows
+- Google Antigravity Desktop 2.0 (`v2.30+`, tested through `v2.33.0+`) on macOS or Windows
 - Node.js `>= 22`
 
 ## 1-Step Installation (Fresh Install or Update to Latest)
@@ -31,7 +31,7 @@ The installer changes user config (theme-patch `user/` files, `product_skin`, `v
    - Enables the 1:1 Claude stratified Model Selector (`模型 · 本次会话`, `1–4` quick keys, separate `思考强度 >` & `更多模型 >` flyouts), radial Context Progress Ring + live 5h/weekly Quota Popover, clean `tok/s · TTFT` pill (stripping `+sub` clutter), opaque `/` & `@` typeahead popups, and pure-text Claude Settings sidebar;
    - Unlocks Antigravity's hidden Developer Step Stream (`project4kMode = 1` / `PRODUCT_SKIN_DEVELOPER` + `verboseConversationSteps = true`) via live CDP and persistent config so intermediate tool & MCP calls are never wiped;
    - Prepends an idempotent `<!-- BEGIN antigravity-claude-ux -->` rule block to `~/.gemini/AGENTS.md` enabling Claude-style mid-turn progress updates, invisible `<!-- todo:N/M -->` progression, official-blue orbiting step timers (`#2F75C3` / `#2F71E3`), and in-flow 3-state `- [ ]` / `- [/]` / `- [x]` live checklist cards compatible with both Developer and Knowledge Work modes;
-   - Registers the `0-token` macOS `launchd` auto-sync watcher (`com.antigravity.claude-ux.autosync`) and triggers immediate hot-reload in the running Antigravity window without restarting the app.
+   - Registers the `0-token` macOS `launchd` auto-sync watcher (`com.antigravity.claude-ux.autosync`), injects the `v2.33.0+` macOS cold-launch `--remote-debugging-port=0` auto-bootstrap into `antigravity-font-daemon.mjs` (keeping `/Applications/Antigravity.app`'s Apple code signature 100% untouched), and triggers immediate hot-reload in the running Antigravity window.
 
 ## Clean Rollback
 ```bash

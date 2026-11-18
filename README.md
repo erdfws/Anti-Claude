@@ -45,16 +45,17 @@
 
 ### 4. 流内实时跟随 + 双布局模式全兼容的 `TodoWrite` 进度卡片
 - **中途进度零可见污染（隐形注释 + 双缓冲读取）**：中途切换阶段只需在进展说明末尾附加隐形 HTML 注释 `<!-- todo:N/M -->`（Markdown 渲染后完全不可见，绝不在正文里打印重复步骤文字；历史 `〔进度 N/M〕` 行亦自动隐藏），前置剥离代码块/反引号示例防误触发，并同时比对 React 18 `fiber` 与 `fiber.alternate` 从回合完整 `container.steps` 读取最新进度。
-- **「软件工程」与「知识工作」双模式全兼容**：切至「知识工作（Knowledge Work）」模式后，哪怕中途带 `- [/]` 的进展步骤被客户端收进 `已工作 · N 条进展` 未挂载 DOM `<ul>`，卡片引擎仍在聚类前预扫 `container.steps` 溯源起点，运行期与收尾期均正常渲染 `14px` 圆角进度卡；回答里普通的 `- [ ]` / `- [x]` 清单（材料清单、审查要点等）则**原样显示、绝不接管**。
+- **「软件工程」、「知识工作」与 `v2.33.0+` 分页虚拟滚动全兼容**：切至「知识工作（Knowledge Work）」模式后，哪怕中途带 `- [/]` 的进展步骤被客户端收进 `已工作 · N 条进展` 未挂载 DOM `<ul>`，或 `v2.33.0+` 长对话重启/翻页时 `autoscroll-viewport` 虚拟卸载了早先的开场轮次，卡片引擎仍会从回合 `container.steps`、同长度未闭环 `<!-- todo:N/M -->` 标记及 `trajectorySlice.stepsInSlice` 分页缓存溯源起点，运行期与收尾期始终稳定渲染 `14px` `#EBEBEB` 圆角边框进度卡；回答里普通的 `- [ ]` / `- [x]` 清单（材料清单、审查要点等）则**原样显示、绝不接管**。
 - **对话流内动态跟随（In-Flow Tail）**：任务执行中，进度卡片始终紧跟当前轮次最后一个步骤节点的正下方——在底部观看时永远实时可见不被顶走；向上翻阅前文时随消息流自然滚走，绝不焊死在输入框头顶遮挡正文或回底按钮。
 - **追问/改需求跨轮接力合并（防双卡 & 防僵尸转圈）**：
   - 任务未全部完成时，用户中途插话追问或补充需求，新一轮清单**自动吞并隐藏上一轮半截旧卡**，全屏始终只留最新 1 张活卡片；
   - 若中途打断，未完成的卡片保留在原位并标注「已暂停」（停止旋转），内容始终可见；
   - 当所有条目 **100% 打勾完工**（复刻 Claude `#666666` 实心圆白勾）后，卡片自动落位归档在总结上方作为完工记录。
 
-### 5. 客户端版本更新自动跟随（0 Token 事件监听守护）
-- macOS 安装时默认注册 `launchd` `WatchPaths` 守护（`com.antigravity.claude-ux.autosync`），监听 `Antigravity.app` 更新，并每 12 小时检查本仓库更新（`git pull --ff-only`，拉取后先做语法与 JSON 校验再部署；已通过 `v2.32.2` 客户端原位更新零损失自愈实测）。
-- 上游内核锁定在经过验证的提交（`install.mjs` 中的 `UPSTREAM_REF`），只升级、不会把你手动装的新版内核降级。
+### 5. 客户端版本更新自动跟随 & `v2.33.0+` 调试端口无感自愈（0 Token 守护）
+- **`Antigravity v2.33.0+` 免改签名冷启动 CDP 自愈**：`v2.33.0` 移除了原版默认内置的 `--remote-debugging-port=0` 并在启动时主动清理旧 `DevToolsActivePort`；安装器自动在常驻主题守护入口（`antigravity-font-daemon.mjs`）注入零开销引导——每当从 Dock、Spotlight 或客户端「重启以更新」刚拉起未带调试端口的新进程（启动 `<= 25s`），1 秒内自动无感补挂 `--remote-debugging-port=0`（完全不触碰 `/Applications/Antigravity.app` 原厂签名，零 Gatekeeper 拦截、不影响 Squirrel 应用内自更新，且绝不打断运行超过 `25s` 的存量会话）。
+- macOS 安装时默认注册 `launchd` `WatchPaths` 守护（`com.antigravity.claude-ux.autosync`），监听 `Antigravity.app` 更新（若本机部署了双开副实例 `Antigravity 2.app` 也会随版本升级自动重同步），并每 12 小时检查本仓库更新（`git pull --ff-only`，拉取后先做语法与 JSON 校验再部署；已通过 `v2.32.2` → `v2.33.0` 跨大版本实机自愈验收）。
+- 上游内核锁定在经过验证的提交（`install.mjs` 中的 `UPSTREAM_REF`，当前基线 `v5.4.2`：含 `plugin://swarm--` 子帧实时主题同步、`NewDocument` 0ms 防闪白与外观设置 `[ 🖥️ | ☀️ | 📖 | 🌙 ]` 四段切换），只升级、不会把你手动装的新版内核降级。
 - **不覆盖你的修改**：`config.json` / `i18n.override.json` 按字段三方合并，你改过的值保留；`custom.css` / `custom.js` 若被你改过，新版本暂存到 `claude-ux/incoming/`，不覆盖（需要时加 `--overwrite-local`，旧文件先另存）。
 - 后台同步不会重新插入你删掉的 `AGENTS.md` 规则块；开发者步骤开关只在客户端版本变化时重新确认。
 
@@ -117,7 +118,7 @@ node ~/Developer/antigravity-claude-ux/install.mjs uninstall
 npm i --no-save jsdom   # 可选：DOM 测试依赖，缺失时自动跳过
 node --test test/
 ```
-覆盖 33 项自动化测试（安装—同步—卸载—重复卸载、原文件缺失、用户配置三方合并、上游校验失败、CDP 断连/超时/异常、普通清单不被接管、热重载清理、键盘打开菜单、多窗格读秒、`<!-- todo:N/M -->` 隐形进度、代码段防误触、React `fiber.alternate` 双缓冲读取、跨轮接力及「知识工作」模式兼容等场景）。未覆盖：真机像素比对、Windows 安装路径。
+覆盖 35 项自动化测试（安装—同步—卸载—重复卸载、原文件缺失、用户配置三方合并、上游校验失败、CDP 断连/超时/异常、普通清单不被接管、热重载清理、键盘打开菜单、多窗格读秒、`<!-- todo:N/M -->` 隐形进度、代码段防误触、React `fiber.alternate` 双缓冲读取、跨轮接力、「知识工作」模式兼容及 `v2.33.0+` 分页虚拟滚动 `trajectorySlice.stepsInSlice` 溯源等场景）。未覆盖：真机像素比对、Windows 安装路径。
 
 ---
 
@@ -162,8 +163,8 @@ node --test test/
 
 - **Pixel-Matched `Claude.app` Visuals & Settings (`user/custom.css`)**: Pure `#FFFFFF` light canvas & `#212120` warm charcoal dark palette, unified `14px` sans-serif typography (`Anthropic Sans` + `PingFang SC`), clean single-layer `18px` composer with opaque `/` & `@` typeahead popups (plus `#ECECEA` dark send orb & `#383835` idle voice button, stripping `+sub` badge noise), and a pure-text Claude-styled Settings sidebar paired with Google official blue (`#2F75C3` / `#2F71E3`) controls and active orbiting step dots.
 - **Stratified Claude Model Menu & Live Plan Quota Ring (`user/custom.js`)**: Replaces the crowded 9-row flat model dropdown with a clean Claude-style popover featuring the 4 core Gemini models (`1–4` hotkeys) plus dedicated `Thinking Effort >` (`Low / Medium / High / XHigh`) and `More Models >` flyouts wired directly to Antigravity's native React Fiber `setSelectedModel`. Adds a radial context progress ring next to the model pill that opens a real-time `5h / weekly` plan quota popover via `retrieveUserQuotaSummary`.
-- **In-Flow `TodoWrite` Card & Knowledge Work Compatibility (`install.mjs` + `user/custom.js`)**: Unlocks `PRODUCT_SKIN_DEVELOPER` + `verboseConversationSteps: true` and unwraps end-of-turn accordions. Mounts active `- [ ]` / `- [/]` / `- [x]` checklists **in-flow at the bottom of the active turn** (scrolling naturally with history without obscuring text), advances mid-turn via zero-noise invisible `<!-- todo:N/M -->` comments across React `fiber` / `fiber.alternate` in **both Developer and Knowledge Work modes**, relays incomplete checklists across follow-up turns, marks interrupted checklists as `Paused` (`已暂停`) in place, and settles `100%` completed cards with `#666666` solid-circle checkmarks.
-- **Zero-Token Auto-Sync Watcher**: Registers a lightweight macOS `launchd` daemon (`com.antigravity.claude-ux.autosync`) that automatically pulls updates and re-applies settings across Antigravity app upgrades (verified zero-loss across `v2.32.2`).
+- **In-Flow `TodoWrite` Card, Knowledge Work & `v2.33+` Virtual-Scroll Compatibility (`install.mjs` + `user/custom.js`)**: Unlocks `PRODUCT_SKIN_DEVELOPER` + `verboseConversationSteps: true` and unwraps end-of-turn accordions. Mounts active `- [ ]` / `- [/]` / `- [x]` checklists **in-flow at the bottom of the active turn** (scrolling naturally with history without obscuring text), advances mid-turn via zero-noise invisible `<!-- todo:N/M -->` comments across React `fiber` / `fiber.alternate` in **both Developer and Knowledge Work modes**, preserves bordered cards across `v2.33.0+` `autoscroll-viewport` virtualized turns via `trajectorySlice.stepsInSlice` origin lookup, relays incomplete checklists across follow-up turns, marks interrupted checklists as `Paused` (`已暂停`) in place, and settles `100%` completed cards with `#666666` solid-circle checkmarks.
+- **`v2.33.0+` Zero-Touch CDP Bootstrap & Auto-Sync Watcher**: Handles Google Antigravity `v2.33.0+`'s removal of default `--remote-debugging-port=0` on macOS without modifying `Antigravity.app` or breaking Apple Developer ID / Squirrel auto-updates — freshly launched (`<= 25s`) non-CDP instances are automatically re-opened with `--remote-debugging-port=0` within `1s`, paired with `com.antigravity.claude-ux.autosync` and upstream `chuanban-antigravity-theme-patch` `v5.4.2`.
 
 ---
 

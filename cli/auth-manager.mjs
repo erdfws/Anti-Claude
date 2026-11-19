@@ -285,13 +285,16 @@ function restartDesktopApp(platform = process.platform) {
       stdio: 'ignore'
     });
   } catch {}
-  /* Detach relaunch so caller can finish cleanly */
+  /* Detach relaunch: wait for existing Antigravity main process to fully exit (up to 8s),
+   * then launch cleanly with --remote-debugging-port=0 so Anti-Claude attaches on first boot. */
   try {
-    const child = spawn(
-      '/bin/sh',
-      ['-c', 'sleep 1.2; /usr/bin/open -a "/Applications/Antigravity.app" --args --remote-debugging-port=0'],
-      { detached: true, stdio: 'ignore' }
-    );
+    const relaunchCmd = [
+      'i=0',
+      'while [ $i -lt 32 ] && pgrep -f "/Applications/Antigravity.app/Contents/MacOS/Antigravity" >/dev/null 2>&1; do sleep 0.25; i=$((i+1)); done',
+      'sleep 0.3',
+      '/usr/bin/open -a "/Applications/Antigravity.app" --args --remote-debugging-port=0'
+    ].join('; ');
+    const child = spawn('/bin/sh', ['-c', relaunchCmd], { detached: true, stdio: 'ignore' });
     child.unref();
     return { restarted: true, cdpEnabled: true };
   } catch (err) {

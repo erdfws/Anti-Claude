@@ -4645,6 +4645,40 @@
   let pendingAuthSwitch = null; /* { kind: 'next'|'switch'|'quota', target?, usedPct?, restartDesktop } */
   let pendingAuthIdleStreak = 0;
   let pendingAuthDrainTimer = 0;
+  let authAutoPollTimer = 0;
+
+  function startAuthAutoBoot() {
+    if (disposed || typeof fetch !== 'function') return;
+    /* Eagerly hydrate auth bridge state on launch without requiring user to open Settings */
+    refreshAuthBridgeState(true).then((st) => {
+      if (disposed) return;
+      if (!st) {
+        later(() => {
+          if (!disposed) refreshAuthBridgeState(true);
+        }, 3000);
+      } else if (st.autoSwitch && st.autoSwitch.enabled) {
+        later(() => {
+          if (!disposed) fetchQuotaSummary(true);
+        }, 2500);
+      }
+    });
+    if (!authAutoPollTimer) {
+      authAutoPollTimer = setInterval(() => {
+        if (disposed) {
+          clearInterval(authAutoPollTimer);
+          authAutoPollTimer = 0;
+          return;
+        }
+        if (!authBridgeState) {
+          refreshAuthBridgeState(false);
+          return;
+        }
+        if (authBridgeState.autoSwitch && authBridgeState.autoSwitch.enabled) {
+          fetchQuotaSummary(true);
+        }
+      }, 45000);
+    }
+  }
 
   function isAnyTurnRunning() {
     if (isPaneCurrentlyRunning()) return true;
@@ -4765,6 +4799,7 @@
   }
 
   tryResumeRouteAfterSwitch();
+  later(() => startAuthAutoBoot(), 800);
 
   function showSettingsToast(text) {
     if (!settingsPanelEl) return;

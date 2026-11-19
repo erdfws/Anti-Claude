@@ -173,3 +173,87 @@ test('import, remove protection, and `node install.mjs auth` CLI subcommand', ()
     h.cleanup();
   }
 });
+
+test('Electron Desktop session sync: snapshots and switches app_storage.json, credential-user-scope & jetski token', () => {
+  const h = makeAuthHome();
+  try {
+    const appDataDir = path.join(h.home, 'Library', 'Application Support', 'Antigravity');
+    fs.mkdirSync(appDataDir, { recursive: true });
+    fs.mkdirSync(path.join(h.home, '.gemini'), { recursive: true });
+    const appStoragePath = path.join(appDataDir, 'app_storage.json');
+    const scopePath = path.join(appDataDir, 'credential-user-scope');
+    const jetskiTokenPath = path.join(h.home, '.gemini', 'jetski-standalone-oauth-token');
+
+    /* Alice is active on both Keyring and Electron Desktop */
+    fs.writeFileSync(
+      appStoragePath,
+      JSON.stringify({
+        'jetski.onboarding.lastLoginUsername': 'alice@example.com',
+        'jetski.onboarding.lastLoginIsGcpTos': 'false',
+        otherKey: 'keep-me'
+      })
+    );
+    fs.writeFileSync(scopePath, 'u_alice_scope_01');
+    fs.writeFileSync(
+      jetskiTokenPath,
+      JSON.stringify({ token: makeNativePayload('alice@example.com', 'tok-alice').token, auth_method: 'consumer' })
+    );
+    h.keyring.set(encodeKeyringPayload(makeNativePayload('alice@example.com', 'tok-alice')));
+
+    let restartCalls = 0;
+    const mgr = createAuthManager({
+      homeDir: h.home,
+      platform: 'darwin',
+      desktopAppDataDir: appDataDir,
+      keyring: h.keyring,
+      isDesktopRunning: () => true,
+      relaunchDesktop: () => {
+        restartCalls++;
+        return { restarted: true, cdpEnabled: true };
+      }
+    });
+
+    const saved = mgr.saveCurrent();
+    assert.equal(saved.ok, true);
+    assert.match(saved.source, /desktop/);
+
+    /* Prepare Bob profile without desktop_meta.json (e.g. imported from CLI) */
+    const bobDir = path.join(h.home, '.gemini', 'auth_profiles', 'bob@example.com');
+    fs.mkdirSync(bobDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(bobDir, 'antigravity_keyring.json'),
+      JSON.stringify(makeNativePayload('bob@example.com', 'tok-bob'))
+    );
+
+    /* Switch to Bob without --restart: Desktop metadata updated & desktopRestartRequired=true */
+    const swBob = mgr.switchAccount('bob@example.com');
+    assert.equal(swBob.ok, true);
+    assert.equal(swBob.desktopSync.synced, true);
+    assert.equal(swBob.desktopSync.appStorageUpdated, true);
+    assert.equal(swBob.desktopSync.scopeAction, 'cleared_for_rebind');
+    assert.equal(swBob.desktopRestartRequired, true);
+    assert.equal(restartCalls, 0);
+
+    const storageAfterBob = JSON.parse(fs.readFileSync(appStoragePath, 'utf8'));
+    assert.equal(storageAfterBob['jetski.onboarding.lastLoginUsername'], 'bob@example.com');
+    assert.equal(storageAfterBob.otherKey, 'keep-me');
+    assert.equal(fs.existsSync(scopePath), false, 'stale scope removed so Desktop re-derives Bob scope');
+
+    /* Switch back to Alice with --restart: restores Alice's saved credential-user-scope and triggers relaunch */
+    const swAlice = mgr.switchAccount('alice@example.com', { restartDesktop: true });
+    assert.equal(swAlice.ok, true);
+    assert.equal(swAlice.desktopSync.scopeAction, 'restored');
+    assert.equal(fs.readFileSync(scopePath, 'utf8'), 'u_alice_scope_01');
+    assert.equal(swAlice.desktopRestart.restarted, true);
+    assert.equal(swAlice.desktopRestartRequired, false);
+    assert.equal(restartCalls, 1);
+
+    /* --scope=cli does not touch Desktop app_storage.json */
+    const swCliOnly = mgr.switchAccount('bob@example.com', { scope: 'cli' });
+    assert.equal(swCliOnly.ok, true);
+    assert.equal(swCliOnly.desktopSync.skipped, 'scope_cli_only');
+    assert.equal(JSON.parse(fs.readFileSync(appStoragePath, 'utf8'))['jetski.onboarding.lastLoginUsername'], 'alice@example.com');
+  } finally {
+    h.cleanup();
+  }
+});

@@ -2177,6 +2177,13 @@
         renderQuotaPopoverBody();
         return;
       }
+      const authCancelQueueBtn = e.target.closest('[data-ag-qp-auth-cancel]');
+      if (authCancelQueueBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (typeof cancelPendingAuthSwitch === 'function') cancelPendingAuthSwitch();
+        return;
+      }
       const authNextBtn = e.target.closest('[data-ag-qp-auth-next]');
       if (authNextBtn) {
         e.preventDefault();
@@ -4628,12 +4635,136 @@
   /* Multi-Account Switcher & Quota Auto-Rotation Bridge Client                 */
   /* -------------------------------------------------------------------------- */
   const AUTH_BRIDGE_URL = 'http://127.0.0.1:47621';
+  const AUTH_RESUME_ROUTE_KEY = 'anti_claude_resume_route_v1';
   let authBridgeState = null;
   let authBridgeOnline = null; /* null = unknown, true = online, false = offline */
   let authBridgeBusy = false;
   let authBridgeLastFetch = 0;
   let authQuotaCheckInFlight = false;
   let authQuotaLastCheckTs = 0;
+  let pendingAuthSwitch = null; /* { kind: 'next'|'switch'|'quota', target?, usedPct?, restartDesktop } */
+  let pendingAuthIdleStreak = 0;
+  let pendingAuthDrainTimer = 0;
+
+  function isAnyTurnRunning() {
+    if (isPaneCurrentlyRunning()) return true;
+    return Boolean(document.querySelector('button[data-testid="input-cancel-button"], .ag-orbit-dots'));
+  }
+
+  function rememberRouteForResume() {
+    try {
+      const route = `${window.location.pathname || ''}${window.location.search || ''}${window.location.hash || ''}`;
+      if (route && route !== '/') {
+        localStorage.setItem(AUTH_RESUME_ROUTE_KEY, JSON.stringify({ route, ts: Date.now() }));
+      }
+    } catch {}
+  }
+
+  function tryResumeRouteAfterSwitch() {
+    try {
+      const raw = localStorage.getItem(AUTH_RESUME_ROUTE_KEY);
+      if (!raw) return;
+      localStorage.removeItem(AUTH_RESUME_ROUTE_KEY);
+      const saved = JSON.parse(raw);
+      if (!saved || !saved.route || Date.now() - Number(saved.ts || 0) > 90000) return;
+      const cur = `${window.location.pathname || ''}${window.location.search || ''}${window.location.hash || ''}`;
+      if (cur === saved.route) return;
+      later(() => {
+        if (disposed) return;
+        const link = document.querySelector(`a[href="${saved.route}"]`);
+        if (link && typeof link.click === 'function') {
+          link.click();
+        } else if (window.history && typeof window.history.pushState === 'function') {
+          window.history.pushState({}, '', saved.route);
+          window.dispatchEvent(new PopStateEvent('popstate'));
+        }
+      }, 900);
+    } catch {}
+  }
+
+  function cancelPendingAuthSwitch() {
+    pendingAuthSwitch = null;
+    pendingAuthIdleStreak = 0;
+    if (pendingAuthDrainTimer) {
+      clearInterval(pendingAuthDrainTimer);
+      pendingAuthDrainTimer = 0;
+    }
+    if (quotaPopoverOpen) renderQuotaPopoverBody();
+    if (settingsPanelEl && !settingsPanelEl.hidden) renderAuthSettingsSlot();
+    showSettingsToast(L('已取消待切换队列', 'Cancelled queued account switch'));
+  }
+
+  async function executeAuthSwitchNow(task) {
+    if (!task || authBridgeBusy) return;
+    authBridgeBusy = true;
+    if (task.restartDesktop) rememberRouteForResume();
+    if (quotaPopoverOpen) renderQuotaPopoverBody();
+    if (settingsPanelEl && !settingsPanelEl.hidden) renderAuthSettingsSlot();
+    let res = null;
+    try {
+      if (task.kind === 'quota') {
+        res = await authBridgeRequest('POST', '/auth/quota-check', { usedPct: task.usedPct });
+      } else if (task.kind === 'next') {
+        res = await authBridgeRequest('POST', '/auth/next', { scope: 'both', restartDesktop: task.restartDesktop });
+      } else if (task.kind === 'switch') {
+        res = await authBridgeRequest('POST', '/auth/switch', {
+          target: task.target,
+          scope: 'both',
+          restartDesktop: task.restartDesktop
+        });
+      }
+    } finally {
+      authBridgeBusy = false;
+    }
+    if (res && res.status) {
+      authBridgeState = Object.assign({}, authBridgeState || {}, res.status);
+    } else {
+      await refreshAuthBridgeState(true);
+    }
+    if (res && (res.switched || res.ok)) {
+      const to = res.to || task.target || '';
+      showSettingsToast(L(`✓ 已切换至 ${to}`, `✓ Switched to ${to}`));
+    }
+    if (quotaPopoverOpen) renderQuotaPopoverBody();
+    if (settingsPanelEl && !settingsPanelEl.hidden) renderAuthSettingsSlot();
+  }
+
+  function queueOrExecuteAuthSwitch(task) {
+    if (task.restartDesktop && isAnyTurnRunning()) {
+      pendingAuthSwitch = task;
+      pendingAuthIdleStreak = 0;
+      if (!pendingAuthDrainTimer) {
+        pendingAuthDrainTimer = setInterval(() => {
+          if (disposed || !pendingAuthSwitch) {
+            clearInterval(pendingAuthDrainTimer);
+            pendingAuthDrainTimer = 0;
+            return;
+          }
+          if (isAnyTurnRunning()) {
+            pendingAuthIdleStreak = 0;
+            return;
+          }
+          pendingAuthIdleStreak += 1;
+          /* Require 2 consecutive idle ticks (~2.4s) so brief gaps between tool calls are never interrupted */
+          if (pendingAuthIdleStreak >= 2) {
+            const nextTask = pendingAuthSwitch;
+            pendingAuthSwitch = null;
+            pendingAuthIdleStreak = 0;
+            clearInterval(pendingAuthDrainTimer);
+            pendingAuthDrainTimer = 0;
+            executeAuthSwitchNow(nextTask);
+          }
+        }, 1200);
+      }
+      if (quotaPopoverOpen) renderQuotaPopoverBody();
+      if (settingsPanelEl && !settingsPanelEl.hidden) renderAuthSettingsSlot();
+      showSettingsToast(L('⏳ 当前有任务运行中，本轮结束后将自动切换账号', '⏳ Turn active — will switch automatically once idle'));
+      return;
+    }
+    executeAuthSwitchNow(task);
+  }
+
+  tryResumeRouteAfterSwitch();
 
   function showSettingsToast(text) {
     if (!settingsPanelEl) return;
@@ -4698,6 +4829,15 @@
     const email = authBridgeState.activeAccount || L('未登录', 'Not signed in');
     const count = Number(authBridgeState.profileCount) || 0;
     const as = authBridgeState.autoSwitch || {};
+    if (pendingAuthSwitch) {
+      return `
+        <div class="ag-qp-divider"></div>
+        <div class="ag-qp-auth-bar">
+          <span class="ag-qp-auth-email">${L('⏳ 本轮结束后自动切换账号', '⏳ Switching once turn finishes')}</span>
+          <button type="button" class="ag-qp-auth-link" data-ag-qp-auth-cancel="true">${L('取消', 'Cancel')}</button>
+        </div>
+      `;
+    }
     const autoBadge = as.enabled
       ? `<span class="ag-qp-auth-badge" title="${escapeHtml(L(`已开启自动轮换（≥ ${as.thresholdUsedPct || 90}%）`, `Auto-switch active (≥ ${as.thresholdUsedPct || 90}%)`))}">${L(`自动 ≥${as.thresholdUsedPct || 90}%`, `Auto ≥${as.thresholdUsedPct || 90}%`)}</span>`
       : '';
@@ -4722,12 +4862,7 @@
 
   async function triggerQuickAuthNext() {
     if (authBridgeBusy) return;
-    authBridgeBusy = true;
-    if (quotaPopoverOpen) renderQuotaPopoverBody();
-    const res = await authBridgeRequest('POST', '/auth/next', { scope: 'both', restartDesktop: true });
-    authBridgeBusy = false;
-    if (res && res.status) authBridgeState = Object.assign({}, authBridgeState, res.status);
-    if (quotaPopoverOpen) renderQuotaPopoverBody();
+    queueOrExecuteAuthSwitch({ kind: 'next', restartDesktop: true });
   }
 
   function openAccountsSettingsSection() {
@@ -4781,9 +4916,15 @@
     if (!as || !as.enabled) return;
     const maxUsed = computeMaxQuotaUsedPct(groups);
     if (maxUsed < (Number(as.thresholdUsedPct) || 90)) return;
-    authQuotaCheckInFlight = true;
     authQuotaLastCheckTs = now;
+    const wantRestart = as.autoRestart !== false;
+    if (wantRestart && isAnyTurnRunning()) {
+      queueOrExecuteAuthSwitch({ kind: 'quota', usedPct: maxUsed, restartDesktop: true });
+      return;
+    }
+    authQuotaCheckInFlight = true;
     try {
+      if (wantRestart) rememberRouteForResume();
       const res = await authBridgeRequest('POST', '/auth/quota-check', { usedPct: maxUsed });
       if (res && res.switched) {
         await refreshAuthBridgeState(true);
@@ -4872,6 +5013,20 @@
           </div>
         </div>
         <div class="ag-cux-settings-group">
+          ${
+            pendingAuthSwitch
+              ? `<div class="ag-cux-settings-row">
+                  <div style="min-width:0">
+                    <div class="ag-cux-settings-title">${L('⏳ 已排入空闲切换队列', '⏳ Account switch queued')}</div>
+                    <div class="ag-cux-settings-desc">${L(
+                      '当前有任务运行中，不会中途打断；本轮彻底完成后将自动切换并恢复原对话。',
+                      'A turn is currently running. Will switch automatically once idle and restore your active chat.'
+                    )}</div>
+                  </div>
+                  <button type="button" class="ag-claude-inline-btn" data-ag-auth-action="cancel-queue">${L('取消', 'Cancel')}</button>
+                </div>`
+              : ''
+          }
           <div class="ag-cux-settings-row">
             <div style="min-width:0">
               <div class="ag-cux-settings-title">${L('当前活跃账号', 'Active Account')}: ${escapeHtml(active || L('未登录', 'Not signed in'))}</div>
@@ -4945,8 +5100,13 @@
             showSettingsToast(L('✓ 已备份当前账号，正在重启进入新账号登录…', '✓ Current account backed up — restarting for sign-in…'));
           }
         } else if (action === 'switch') {
-          res = await authBridgeRequest('POST', '/auth/switch', { target, scope: 'both', restartDesktop: true });
-          if (res && res.ok) showSettingsToast(L(`✓ 已切换至 ${res.to}，正在生效…`, `✓ Switched to ${res.to}`));
+          authBridgeBusy = false;
+          queueOrExecuteAuthSwitch({ kind: 'switch', target, restartDesktop: true });
+          return;
+        } else if (action === 'cancel-queue') {
+          authBridgeBusy = false;
+          cancelPendingAuthSwitch();
+          return;
         } else if (action === 'remove') {
           res = await authBridgeRequest('POST', '/auth/remove', { target });
           if (res && res.ok) showSettingsToast(L(`✓ 已移除 ${res.account}`, `✓ Removed ${res.account}`));

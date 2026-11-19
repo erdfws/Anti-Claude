@@ -6,6 +6,7 @@
  * Commands:
  *   node install.mjs install [--cli] [--cli-only] [--no-cli] [--no-cli-statusline] [--no-auto-update] [--no-step-unlock] [--no-agents-rule] [--overwrite-local]
  *   node install.mjs sync-upgrade [--force] [--overwrite-local]
+ *   node install.mjs auth [list|save|switch|next|import|remove]
  *   node install.mjs auto-update-on | auto-update-off
  *   node install.mjs doctor
  *   node install.mjs sync-fonts
@@ -27,6 +28,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createAuthManager, runAuthCli } from './cli/auth-manager.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -347,6 +349,18 @@ function detectAntigravityCli() {
     settings?.statusLine?.enabled === true &&
       String(settings?.statusLine?.command || '').includes(AGY_CLI_STATUSLINE_NAME)
   );
+  let auth = null;
+  if (!NO_CLI) {
+    try {
+      const st = createAuthManager({ homeDir: HOME }).inspectStatus();
+      auth = {
+        activeAccount: st.activeAccount,
+        liveKeyringEmail: st.liveKeyringEmail,
+        keyringInSync: st.keyringInSync,
+        profileCount: st.profileCount
+      };
+    } catch {}
+  }
   return {
     detected: Boolean(binary || configDirExists),
     binary,
@@ -355,7 +369,8 @@ function detectAntigravityCli() {
     configDirExists,
     settingsExists,
     statusLineInstalled,
-    statusLineEnabled
+    statusLineEnabled,
+    auth
   };
 }
 
@@ -471,7 +486,7 @@ function saveState(state) {
 
 function validateSourceRoot(root = __dirname) {
   const problems = [];
-  for (const rel of ['install.mjs', 'user/custom.js', 'cli/statusline.mjs']) {
+  for (const rel of ['install.mjs', 'user/custom.js', 'cli/statusline.mjs', 'cli/auth-manager.mjs']) {
     try {
       execFileSync(process.execPath, ['--check', path.join(root, rel)], { stdio: 'pipe' });
     } catch (err) {
@@ -1642,6 +1657,12 @@ async function main(argv) {
   const flags = new Set(argv.slice(1));
   if (sub === 'install') return cmdInstall(flags);
   if (sub === 'sync-upgrade') return cmdSyncUpgrade(flags);
+  if (sub === 'auth') {
+    const res = runAuthCli(argv.slice(1));
+    console.log(JSON.stringify(res, null, 2));
+    if (!res.ok) process.exitCode = 1;
+    return res;
+  }
   if (sub === 'auto-update-on') {
     const state = loadState();
     if (state) {

@@ -23,6 +23,7 @@ Common commands:
 
 ```bash
 node ~/Developer/Anti-Claude/install.mjs install --cli-only    # Antigravity CLI (agy) only — macOS / Linux / Windows
+node ~/Developer/Anti-Claude/install.mjs auth list             # List / save / switch agy CLI accounts (`auth save`, `auth switch <n|email>`, `auth next`)
 node ~/Developer/Anti-Claude/install.mjs sync-upgrade --force  # Pull updates and hot-reload
 node ~/Developer/Anti-Claude/install.mjs doctor                # Inspect health of all layers (Desktop & CLI)
 node ~/Developer/Anti-Claude/install.mjs uninstall             # Uninstall and restore original config
@@ -50,6 +51,7 @@ By default, Antigravity hides reasoning inside collapsed `thinking` blocks, runs
 - **Auto-detected or standalone CLI mode**: Running `install` automatically configures Antigravity CLI (`agy`) when detected alongside Desktop (disable with `--no-cli`), or run `install --cli-only` on macOS, Linux, or Windows to install CLI support without requiring Antigravity Desktop or CDP.
 - **Zero-dependency Claude-style status line**: Deploys `~/.gemini/antigravity-cli/anti-claude-statusline.mjs` and wires `statusLine` in `~/.gemini/antigravity-cli/settings.json` to display active model, color-coded context progress bar, Git branch/dirty marker, workspace name, and live agent state with automatic narrow-terminal adaptation (skip with `--no-cli-statusline`).
 - **Shared execution rules & clean rollback**: Shares `~/.gemini/AGENTS.md` (with graceful terminal fallback when `ask_question` is unavailable), respects user edits to `settings.json` / statusline scripts on `sync-upgrade`, and restores prior `statusLine` settings cleanly on `uninstall`.
+- **Multi-account switcher (`auth`)**: Manage and switch multiple Antigravity CLI accounts via `node install.mjs auth [list|save|switch|next|import|remove]` with lossless `go-keyring-base64:` system keyring sync (macOS Keychain / Linux `secret-tool`), automatic live-token backup before switching, and full compatibility with `~/.gemini/auth_profiles/` and `~/.gemini/google_accounts.json`.
 
 ## Local Footprint
 

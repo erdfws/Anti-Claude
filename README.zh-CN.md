@@ -23,6 +23,7 @@ node ~/Developer/Anti-Claude/install.mjs install
 
 ```bash
 node ~/Developer/Anti-Claude/install.mjs install --cli-only    # 仅安装 Antigravity CLI (agy) 支持（跨平台免桌面端）
+node ~/Developer/Anti-Claude/install.mjs auth list             # 查看/保存/切换 agy CLI 账号（`auth save` / `auth switch <序号|邮箱>` / `auth next`）
 node ~/Developer/Anti-Claude/install.mjs sync-upgrade --force  # 拉取更新并热重载
 node ~/Developer/Anti-Claude/install.mjs doctor                # 检查各层状态（含桌面端与 CLI）
 node ~/Developer/Anti-Claude/install.mjs uninstall             # 卸载并还原原配置
@@ -50,6 +51,7 @@ node ~/Developer/Anti-Claude/install.mjs uninstall             # 卸载并还原
 - **自动识别与纯 CLI 模式**：默认运行 `install` 时若检测到本机已安装 `agy` 或存在 `~/.gemini/antigravity-cli`，会自动一并配置 CLI 支持（可用 `--no-cli` 跳过）；也可运行 `install --cli-only` 仅部署 CLI 层，无需桌面端或 CDP，支持 macOS / Linux / Windows。
 - **零依赖 Claude 风格终端状态栏**：自动部署 `~/.gemini/antigravity-cli/anti-claude-statusline.mjs` 并在 `~/.gemini/antigravity-cli/settings.json` 中启用 `statusLine`，实时展示当前模型、分级配色上下文进度条、Git 分支与脏状态、工作区名及运行状态，并随终端宽度自动精简防换行（可用 `--no-cli-statusline` 跳过）。
 - **共享规则与无损回滚**：复用 `~/.gemini/AGENTS.md`（非交互终端自动降级选项提示），升级时尊重用户手动改过的 `statusLine` 配置，执行 `uninstall` 时逐项还原原配置并清理脚本。
+- **多账号极速切换（`auth`）**：通过 `node install.mjs auth [list|save|switch|next|import|remove]` 管理与切换多个 Antigravity CLI 账号，原生兼容 `agy` 的 `go-keyring-base64:` 系统钥匙串格式（macOS Keychain / Linux `secret-tool`），切换前自动备份当前最新 Keyring 凭据并兼容 `~/.gemini/auth_profiles/` 目录结构。
 
 ## 本机改动范围
 

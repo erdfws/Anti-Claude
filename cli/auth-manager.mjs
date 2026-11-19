@@ -148,6 +148,14 @@ export function createSystemKeyring({ platform = process.platform, mockFile = pr
         fs.mkdirSync(path.dirname(mockFile), { recursive: true });
         fs.writeFileSync(mockFile, JSON.stringify(store, null, 2), { encoding: 'utf8', mode: 0o600 });
         return true;
+      },
+      clear(service = KEYRING_SERVICE, account = KEYRING_ACCOUNT) {
+        try {
+          const store = JSON.parse(fs.readFileSync(mockFile, 'utf8'));
+          delete store[`${service}:${account}`];
+          fs.writeFileSync(mockFile, JSON.stringify(store, null, 2), { encoding: 'utf8', mode: 0o600 });
+        } catch {}
+        return true;
       }
     };
   }
@@ -168,6 +176,17 @@ export function createSystemKeyring({ platform = process.platform, mockFile = pr
       set(password, service = KEYRING_SERVICE, account = KEYRING_ACCOUNT) {
         try {
           execFileSync('security', ['add-generic-password', '-s', service, '-a', account, '-w', password, '-U'], {
+            timeout: 4000,
+            stdio: 'ignore'
+          });
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      clear(service = KEYRING_SERVICE, account = KEYRING_ACCOUNT) {
+        try {
+          execFileSync('security', ['delete-generic-password', '-s', service, '-a', account], {
             timeout: 4000,
             stdio: 'ignore'
           });
@@ -204,6 +223,17 @@ export function createSystemKeyring({ platform = process.platform, mockFile = pr
         } catch {
           return false;
         }
+      },
+      clear(service = KEYRING_SERVICE, account = KEYRING_ACCOUNT) {
+        try {
+          execFileSync('secret-tool', ['clear', 'service', service, 'username', account], {
+            timeout: 4000,
+            stdio: 'ignore'
+          });
+          return true;
+        } catch {
+          return false;
+        }
       }
     };
   }
@@ -213,6 +243,9 @@ export function createSystemKeyring({ platform = process.platform, mockFile = pr
       return null;
     },
     set() {
+      return false;
+    },
+    clear() {
       return false;
     }
   };
@@ -720,13 +753,62 @@ export function createAuthManager({
     return { ok: true, action: 'removed', account: resolved.name };
   }
 
+  function prepareNewAccountLogin({ restartDesktop = false } = {}) {
+    /* Always snapshot the currently signed-in account first so nothing is ever lost */
+    let backedUp = null;
+    const live = readLiveKeyring();
+    const std = readJsonSafe(credsFile, null);
+    const jetski = readJsonSafe(jetskiTokenFile, null);
+    if (live || std || jetski) {
+      const saved = saveCurrent();
+      if (!saved.ok) {
+        return { ok: false, error: `backup_before_new_login_failed: ${saved.error}` };
+      }
+      backedUp = saved.account;
+    }
+
+    const keyringCleared = typeof keyring.clear === 'function' ? keyring.clear(KEYRING_SERVICE, KEYRING_ACCOUNT) : false;
+    for (const f of [credsFile, idFile, jetskiTokenFile, mcpTokenCache, credScopeFile]) {
+      try {
+        fs.rmSync(f, { force: true });
+      } catch {}
+    }
+
+    if (fs.existsSync(appStorageFile)) {
+      const appStorage = readJsonSafe(appStorageFile, null);
+      if (appStorage && typeof appStorage === 'object' && !Array.isArray(appStorage)) {
+        delete appStorage['jetski.onboarding.lastLoginUsername'];
+        writeFileSecure(appStorageFile, JSON.stringify(appStorage), 0o644);
+      }
+    }
+
+    const data = getAccountsData();
+    if (data.active && !data.old.includes(data.active)) data.old.push(data.active);
+    data.active = null;
+    saveAccountsData(data);
+
+    let desktopRestart = { skipped: true };
+    if (restartDesktop && isDesktopRunning()) {
+      desktopRestart = relaunchDesktop();
+    }
+
+    return {
+      ok: true,
+      action: 'prepared_new_login',
+      backedUp,
+      keyringCleared,
+      desktopRestart
+    };
+  }
+
   return {
     inspectStatus,
     saveCurrent,
     switchAccount,
     switchNext,
     importProfile,
-    removeProfile
+    removeProfile,
+    prepareNewAccountLogin
   };
 }
 

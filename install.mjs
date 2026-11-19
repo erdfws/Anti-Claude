@@ -486,7 +486,7 @@ function saveState(state) {
 
 function validateSourceRoot(root = __dirname) {
   const problems = [];
-  for (const rel of ['install.mjs', 'user/custom.js', 'cli/statusline.mjs', 'cli/auth-manager.mjs']) {
+  for (const rel of ['install.mjs', 'user/custom.js', 'cli/statusline.mjs', 'cli/auth-manager.mjs', 'cli/auth-bridge.mjs']) {
     try {
       execFileSync(process.execPath, ['--check', path.join(root, rel)], { stdio: 'pipe' });
     } catch (err) {
@@ -960,8 +960,9 @@ function ensureMacCdpBootstrapWrapper() {
   const coreDaemonPath = path.join(THEME_PATCH_DIR, 'core', 'daemon.mjs');
   if (!fs.existsSync(coreDaemonPath)) return { skipped: 'core_daemon_missing' };
   const coreUrl = `file://${coreDaemonPath}`;
+  const bridgeUrl = `file://${path.join(__dirname, 'cli', 'auth-bridge.mjs')}`;
   const wrapperSrc = `#!/usr/bin/env node
-// Auto-generated wrapper -> ${coreDaemonPath} (with Antigravity 2.33.0+ CDP bootstrap)
+// Auto-generated wrapper -> ${coreDaemonPath} (with Antigravity 2.33.0+ CDP bootstrap & local auth bridge)
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -1043,6 +1044,12 @@ if (process.platform === 'darwin' && !process.argv.includes('--once')) {
 
   setInterval(checkFreshLaunch, 1200).unref();
   checkFreshLaunch();
+}
+
+if (!process.argv.includes('--once')) {
+  import(${JSON.stringify(bridgeUrl)})
+    .then((m) => m.startAuthBridge())
+    .catch(() => {});
 }
 
 await import(${JSON.stringify(coreUrl)});
@@ -1662,6 +1669,12 @@ async function main(argv) {
     console.log(JSON.stringify(res, null, 2));
     if (!res.ok) process.exitCode = 1;
     return res;
+  }
+  if (sub === 'auth-bridge') {
+    const { startAuthBridge } = await import('./cli/auth-bridge.mjs');
+    const info = await startAuthBridge();
+    console.log(JSON.stringify({ ok: true, listening: !info.alreadyRunning, alreadyRunning: info.alreadyRunning, host: info.host, port: info.port }));
+    return info;
   }
   if (sub === 'auto-update-on') {
     const state = loadState();

@@ -51,7 +51,7 @@ node ~/Developer/Anti-Claude/install.mjs uninstall             # 卸载并还原
 - **自动识别与纯 CLI 模式**：默认运行 `install` 时若检测到本机已安装 `agy` 或存在 `~/.gemini/antigravity-cli`，会自动一并配置 CLI 支持（可用 `--no-cli` 跳过）；也可运行 `install --cli-only` 仅部署 CLI 层，无需桌面端或 CDP，支持 macOS / Linux / Windows。
 - **零依赖 Claude 风格终端状态栏**：自动部署 `~/.gemini/antigravity-cli/anti-claude-statusline.mjs` 并在 `~/.gemini/antigravity-cli/settings.json` 中启用 `statusLine`，实时展示当前模型、分级配色上下文进度条、Git 分支与脏状态、工作区名及运行状态，并随终端宽度自动精简防换行（可用 `--no-cli-statusline` 跳过）。
 - **共享规则与无损回滚**：复用 `~/.gemini/AGENTS.md`（非交互终端自动降级选项提示），升级时尊重用户手动改过的 `statusLine` 配置，执行 `uninstall` 时逐项还原原配置并清理脚本。
-- **多账号极速切换（`auth`）**：通过 `node install.mjs auth [list|save|switch|next|import|remove] [--restart] [--scope=both|desktop|cli]` 统一管理与切换 **Antigravity Electron 桌面端 + CLI（`agy`）** 多账号，原生兼容 `go-keyring-base64:` 系统钥匙串并同步桌面端 `app_storage.json`、`credential-user-scope` 与 `jetski-standalone-oauth-token`（支持 `--restart` 优雅重启桌面端并保持 CDP 注入），切换前自动备份当前最新凭据且兼容 `~/.gemini/auth_profiles/`。
+- **桌面端 GUI + CLI 多账号切换与按额度自动轮换（`auth` & `auth-bridge`）**：在桌面端 **「设置 → 界面增强」** 与 **额度圆环弹窗底部** 直接提供可视化操作——支持「保存当前账号」「添加新账号（先自动备份当前账号再重启进入官方登录页）」「一键切换」「移除账号」以及「实时套餐已用额度达阈值自动轮换（支持自定义 `80%–100%` 阈值与自动重启）」，同时支持命令行 `node install.mjs auth [list|save|switch|next|import|remove] [--restart] [--scope=both|desktop|cli]`。通过仅监听回环地址的本地桥接服务（`127.0.0.1:47621`）联动 `go-keyring-base64:` 钥匙串与桌面端 `app_storage.json` / `credential-user-scope`。
 
 ## 本机改动范围
 

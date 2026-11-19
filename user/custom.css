@@ -2869,3 +2869,170 @@ html:not([data-ag-theme-mode="dark"]) body:not(.dark) .ag-cux-toast {
   background-color: rgba(47, 113, 227, 0.16) !important;
   color: #78A9FF !important;
 }
+
+/* ============================================================================
+ * 3.15 多账号切换与额度自动轮换 GUI 样式（额度弹窗底部栏 & Settings 卡片）
+ * ============================================================================ */
+.ag-qp-auth-bar {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 8px !important;
+  padding-top: 2px !important;
+}
+
+.ag-qp-auth-info {
+  min-width: 0 !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+}
+
+.ag-qp-auth-email {
+  font-size: 12px !important;
+  color: #676765 !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  max-width: 170px !important;
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) .ag-qp-auth-email {
+  color: #9A9994 !important;
+}
+
+.ag-qp-auth-badge {
+  font-size: 11px !important;
+  line-height: 1 !important;
+  padding: 2px 6px !important;
+  border-radius: 999px !important;
+  background-color: #F0F4FA !important;
+  color: #2F75C3 !important;
+  flex-shrink: 0 !important;
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) .ag-qp-auth-badge {
+  background-color: rgba(47, 113, 227, 0.18) !important;
+  color: #78A9FF !important;
+}
+
+.ag-qp-auth-actions {
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+  flex-shrink: 0 !important;
+}
+
+.ag-qp-auth-btn {
+  height: 22px !important;
+  padding: 0 8px !important;
+  border: none !important;
+  border-radius: 6px !important;
+  font-family: var(--font-sans) !important;
+  font-size: 11.5px !important;
+  cursor: pointer !important;
+  background-color: #EFEFED !important;
+  color: #191918 !important;
+  transition: background-color 120ms ease !important;
+}
+
+.ag-qp-auth-btn:hover:not(:disabled) {
+  background-color: #E3E3DF !important;
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) .ag-qp-auth-btn {
+  background-color: #343431 !important;
+  color: #ECECEA !important;
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) .ag-qp-auth-btn:hover:not(:disabled) {
+  background-color: #40403C !important;
+}
+
+.ag-qp-auth-link {
+  border: none !important;
+  background: transparent !important;
+  padding: 2px 4px !important;
+  font-family: var(--font-sans) !important;
+  font-size: 12px !important;
+  color: #2F75C3 !important;
+  cursor: pointer !important;
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) .ag-qp-auth-link {
+  color: #78A9FF !important;
+}
+
+.ag-qp-auth-link:hover {
+  text-decoration: underline !important;
+}
+
+.ag-cux-auth-hdr {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  gap: 10px !important;
+  flex-wrap: wrap !important;
+}
+
+.ag-cux-auth-row-title {
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+  flex-wrap: wrap !important;
+  max-width: 100% !important;
+}
+
+.ag-cux-auth-row-actions {
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+  flex-shrink: 0 !important;
+}
+
+.ag-cux-auth-pill {
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  line-height: 1 !important;
+  padding: 3px 7px !important;
+  border-radius: 999px !important;
+  background-color: #EFEFED !important;
+  color: #5E5E5B !important;
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) .ag-cux-auth-pill {
+  background-color: #343431 !important;
+  color: #B2B1AC !important;
+}
+
+.ag-cux-auth-pill[data-kind="active"] {
+  background-color: #E7F3EC !important;
+  color: #1E7A45 !important;
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) .ag-cux-auth-pill[data-kind="active"] {
+  background-color: rgba(34, 197, 94, 0.16) !important;
+  color: #6EE7A0 !important;
+}
+
+.ag-cux-auth-select {
+  height: 28px !important;
+  padding: 0 8px !important;
+  border-radius: 7px !important;
+  font-family: var(--font-sans) !important;
+  font-size: 12.5px !important;
+  cursor: pointer !important;
+  outline: none !important;
+}
+
+html:not([data-ag-theme-mode="dark"]) body:not(.dark) .ag-cux-auth-select {
+  background-color: #FFFFFF !important;
+  border: 1px solid #DCDCD7 !important;
+  color: #191918 !important;
+}
+
+:is(html[data-ag-theme-mode="dark"] body, body.dark) .ag-cux-auth-select {
+  background-color: #2E2E2B !important;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  color: #ECECEA !important;
+}

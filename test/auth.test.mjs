@@ -18,6 +18,7 @@ import {
   createSystemKeyring,
   createAuthManager
 } from '../cli/auth-manager.mjs';
+import { startAuthBridge } from '../cli/auth-bridge.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const INSTALL = path.join(REPO, 'install.mjs');
@@ -254,6 +255,83 @@ test('Electron Desktop session sync: snapshots and switches app_storage.json, cr
     assert.equal(swCliOnly.desktopSync.skipped, 'scope_cli_only');
     assert.equal(JSON.parse(fs.readFileSync(appStoragePath, 'utf8'))['jetski.onboarding.lastLoginUsername'], 'alice@example.com');
   } finally {
+    h.cleanup();
+  }
+});
+
+test('local auth bridge HTTP API: security headers, add-account backup, and quota-triggered auto-switch', async () => {
+  const h = makeAuthHome();
+  let bridge = null;
+  try {
+    h.keyring.set(encodeKeyringPayload(makeNativePayload('alice@example.com', 'tok-alice')));
+    const bobDir = path.join(h.home, '.gemini', 'auth_profiles', 'bob@example.com');
+    fs.mkdirSync(bobDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(bobDir, 'antigravity_keyring.json'),
+      JSON.stringify(makeNativePayload('bob@example.com', 'tok-bob'))
+    );
+
+    let restartCount = 0;
+    const mgr = createAuthManager({
+      homeDir: h.home,
+      keyring: h.keyring,
+      isDesktopRunning: () => true,
+      relaunchDesktop: () => {
+        restartCount++;
+        return { restarted: true, cdpEnabled: true };
+      }
+    });
+
+    bridge = await startAuthBridge({ port: 0, homeDir: h.home, authManager: mgr });
+    const base = `http://${bridge.host}:${bridge.port}`;
+    const post = (p, body, extraHeaders = {}) =>
+      fetch(`${base}${p}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Anti-Claude-Bridge': '1', ...extraHeaders },
+        body: JSON.stringify(body)
+      });
+
+    /* Security: reject external origin & missing CSRF header */
+    const badOrigin = await fetch(`${base}/auth/status`, { headers: { Origin: 'https://evil.example' } });
+    assert.equal(badOrigin.status, 403);
+    const noHeader = await fetch(`${base}/auth/save`, { method: 'POST', body: '{}' });
+    assert.equal(noHeader.status, 403);
+
+    /* Save active account (Alice) */
+    const saveRes = await (await post('/auth/save', {})).json();
+    assert.equal(saveRes.ok, true);
+    assert.equal(saveRes.account, 'alice@example.com');
+
+    /* Enable auto-switch at 90% threshold */
+    const cfgRes = await (await post('/auth/config', { autoSwitch: { enabled: true, thresholdUsedPct: 90, autoRestart: true } })).json();
+    assert.equal(cfgRes.ok, true);
+    assert.equal(cfgRes.autoSwitch.enabled, true);
+
+    /* Below threshold (80%) -> no switch */
+    const below = await (await post('/auth/quota-check', { usedPct: 80 })).json();
+    assert.equal(below.switched, false);
+    assert.equal(below.reason, 'below_threshold');
+
+    /* At threshold (92%) -> auto-switches Alice -> Bob and restarts Desktop */
+    const hit = await (await post('/auth/quota-check', { usedPct: 92 })).json();
+    assert.equal(hit.switched, true);
+    assert.equal(hit.to, 'bob@example.com');
+    assert.equal(restartCount, 1);
+
+    /* Immediate second check hits cooldown */
+    const cool = await (await post('/auth/quota-check', { usedPct: 95 })).json();
+    assert.equal(cool.switched, false);
+    assert.equal(cool.reason, 'cooldown_active');
+
+    /* Add new account backs up Bob and clears live keyring for fresh sign-in */
+    const addRes = await (await post('/auth/add-account', { restartDesktop: true })).json();
+    assert.equal(addRes.ok, true);
+    assert.equal(addRes.backedUp, 'bob@example.com');
+    assert.equal(addRes.keyringCleared, true);
+    assert.equal(h.keyring.get(), null);
+    assert.equal(restartCount, 2);
+  } finally {
+    if (bridge?.server) bridge.server.close();
     h.cleanup();
   }
 });

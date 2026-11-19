@@ -2083,6 +2083,7 @@
         cachedQuotaGroups = rawGroups.filter((g) => g && Array.isArray(g.buckets) && g.buckets.length > 0);
         lastQuotaFetchTs = Date.now();
         if (quotaPopoverOpen) renderQuotaPopoverBody();
+        if (typeof maybeTriggerQuotaAutoSwitch === 'function') maybeTriggerQuotaAutoSwitch(cachedQuotaGroups);
         return cachedQuotaGroups;
       })
       .catch(() => {
@@ -2174,6 +2175,20 @@
         e.stopPropagation();
         selectedQuotaGroupIdx = Number(tabBtn.getAttribute('data-ag-quota-tab')) || 0;
         renderQuotaPopoverBody();
+        return;
+      }
+      const authNextBtn = e.target.closest('[data-ag-qp-auth-next]');
+      if (authNextBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!authNextBtn.disabled && typeof triggerQuickAuthNext === 'function') triggerQuickAuthNext();
+        return;
+      }
+      const authManageBtn = e.target.closest('[data-ag-qp-auth-manage]');
+      if (authManageBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (typeof openAccountsSettingsSection === 'function') openAccountsSettingsSection();
         return;
       }
       const viewAll = e.target.closest('[data-ag-quota-view-all]');
@@ -2351,6 +2366,7 @@
       <div class="ag-qp-divider"></div>
       ${tabsHtml}
       <div class="ag-qp-group-list">${quotaRowsHtml}</div>
+      ${typeof renderQuotaAuthFooterHtml === 'function' ? renderQuotaAuthFooterHtml() : ''}
     `;
     positionQuotaPopover();
   }
@@ -2367,6 +2383,7 @@
     renderQuotaPopoverBody();
     pop.setAttribute('data-open', 'true');
     positionQuotaPopover();
+    if (typeof refreshAuthBridgeState === 'function') refreshAuthBridgeState();
     fetchQuotaSummary(false).then(() => {
       if (Date.now() - lastQuotaFetchTs > 12000) fetchQuotaSummary(true);
     });
@@ -4607,6 +4624,380 @@
   let settingsPanelEl = null;
   let settingsToastTimer = 0;
 
+  /* -------------------------------------------------------------------------- */
+  /* Multi-Account Switcher & Quota Auto-Rotation Bridge Client                 */
+  /* -------------------------------------------------------------------------- */
+  const AUTH_BRIDGE_URL = 'http://127.0.0.1:47621';
+  let authBridgeState = null;
+  let authBridgeOnline = null; /* null = unknown, true = online, false = offline */
+  let authBridgeBusy = false;
+  let authBridgeLastFetch = 0;
+  let authQuotaCheckInFlight = false;
+  let authQuotaLastCheckTs = 0;
+
+  function showSettingsToast(text) {
+    if (!settingsPanelEl) return;
+    const toast = settingsPanelEl.querySelector('[data-ag-cux-toast]');
+    if (!toast) return;
+    if (text) toast.textContent = text;
+    toast.setAttribute('data-visible', 'true');
+    cancelLater(settingsToastTimer);
+    settingsToastTimer = later(() => {
+      toast.setAttribute('data-visible', 'false');
+    }, 2200);
+  }
+
+  async function authBridgeRequest(method, endpoint, body) {
+    if (typeof fetch !== 'function') return { ok: false, offline: true };
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), 2800) : 0;
+    try {
+      const headers = { 'X-Anti-Claude-Bridge': '1' };
+      const init = { method, headers };
+      if (ctrl) init.signal = ctrl.signal;
+      if (body !== undefined) {
+        headers['Content-Type'] = 'application/json';
+        init.body = JSON.stringify(body);
+      }
+      const res = await fetch(`${AUTH_BRIDGE_URL}${endpoint}`, init);
+      const data = await res.json().catch(() => ({}));
+      authBridgeOnline = true;
+      return data;
+    } catch {
+      authBridgeOnline = false;
+      return { ok: false, offline: true };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async function refreshAuthBridgeState(force = false) {
+    if (disposed) return null;
+    const now = Date.now();
+    if (!force && authBridgeState && now - authBridgeLastFetch < 6000) return authBridgeState;
+    const data = await authBridgeRequest('GET', '/auth/status');
+    if (data && data.ok) {
+      authBridgeState = data;
+      authBridgeLastFetch = Date.now();
+    }
+    if (quotaPopoverOpen) renderQuotaPopoverBody();
+    if (settingsPanelEl && !settingsPanelEl.hidden) renderAuthSettingsSlot();
+    return authBridgeState;
+  }
+
+  function renderQuotaAuthFooterHtml() {
+    if (authBridgeOnline === false || !authBridgeState) {
+      return `
+        <div class="ag-qp-divider"></div>
+        <div class="ag-qp-auth-bar">
+          <span class="ag-qp-auth-email">${L('多账号切换与额度轮换', 'Multi-account switcher')}</span>
+          <button type="button" class="ag-qp-auth-link" data-ag-qp-auth-manage="true">${L('管理账号', 'Manage')}</button>
+        </div>
+      `;
+    }
+    const email = authBridgeState.activeAccount || L('未登录', 'Not signed in');
+    const count = Number(authBridgeState.profileCount) || 0;
+    const as = authBridgeState.autoSwitch || {};
+    const autoBadge = as.enabled
+      ? `<span class="ag-qp-auth-badge" title="${escapeHtml(L(`已开启自动轮换（≥ ${as.thresholdUsedPct || 90}%）`, `Auto-switch active (≥ ${as.thresholdUsedPct || 90}%)`))}">${L(`自动 ≥${as.thresholdUsedPct || 90}%`, `Auto ≥${as.thresholdUsedPct || 90}%`)}</span>`
+      : '';
+    const nextBtn =
+      count >= 2
+        ? `<button type="button" class="ag-qp-auth-btn" data-ag-qp-auth-next="true"${authBridgeBusy ? ' disabled' : ''}>${L('切下一账号', 'Switch next')}</button>`
+        : '';
+    return `
+      <div class="ag-qp-divider"></div>
+      <div class="ag-qp-auth-bar">
+        <div class="ag-qp-auth-info">
+          <span class="ag-qp-auth-email" title="${escapeHtml(email)}">${escapeHtml(email)}</span>
+          ${autoBadge}
+        </div>
+        <div class="ag-qp-auth-actions">
+          ${nextBtn}
+          <button type="button" class="ag-qp-auth-link" data-ag-qp-auth-manage="true">${L('管理', 'Manage')}</button>
+        </div>
+      </div>
+    `;
+  }
+
+  async function triggerQuickAuthNext() {
+    if (authBridgeBusy) return;
+    authBridgeBusy = true;
+    if (quotaPopoverOpen) renderQuotaPopoverBody();
+    const res = await authBridgeRequest('POST', '/auth/next', { scope: 'both', restartDesktop: true });
+    authBridgeBusy = false;
+    if (res && res.status) authBridgeState = Object.assign({}, authBridgeState, res.status);
+    if (quotaPopoverOpen) renderQuotaPopoverBody();
+  }
+
+  function openAccountsSettingsSection() {
+    closeQuotaPopover();
+    const settingsBtn = document.querySelector('button[data-testid="settings-button"]');
+    if (!settingsBtn) return;
+    settingsBtn.click();
+    let tries = 0;
+    const jumpUx = () => {
+      reconcileSettingsPanel();
+      if (settingsNavBtn) {
+        openClaudeUxSettingsPane();
+        later(() => {
+          const sec = settingsPanelEl && settingsPanelEl.querySelector('#ag-cux-auth-section');
+          if (sec && typeof sec.scrollIntoView === 'function') sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, 60);
+      } else if (++tries < 15) {
+        frame(jumpUx);
+      }
+    };
+    frame(jumpUx);
+  }
+
+  function computeMaxQuotaUsedPct(groups) {
+    if (!Array.isArray(groups) || !groups.length) return -1;
+    const idx = detectDefaultGroupIndex(groups);
+    const grp = groups[idx] || groups[0];
+    let maxUsed = -1;
+    for (const b of grp.buckets || []) {
+      const rem =
+        b.remaining && b.remaining.case === 'remainingFraction' && typeof b.remaining.value === 'number'
+          ? b.remaining.value
+          : typeof b.remainingFraction === 'number'
+            ? b.remainingFraction
+            : null;
+      if (rem === null) continue;
+      const used = Math.max(0, Math.min(100, Math.round((1 - rem) * 100)));
+      if (used > maxUsed) maxUsed = used;
+    }
+    return maxUsed;
+  }
+
+  async function maybeTriggerQuotaAutoSwitch(groups) {
+    if (disposed || authQuotaCheckInFlight) return;
+    const now = Date.now();
+    if (now - authQuotaLastCheckTs < 20000) return;
+    if (!authBridgeState) {
+      await refreshAuthBridgeState(false);
+    }
+    const as = authBridgeState && authBridgeState.autoSwitch;
+    if (!as || !as.enabled) return;
+    const maxUsed = computeMaxQuotaUsedPct(groups);
+    if (maxUsed < (Number(as.thresholdUsedPct) || 90)) return;
+    authQuotaCheckInFlight = true;
+    authQuotaLastCheckTs = now;
+    try {
+      const res = await authBridgeRequest('POST', '/auth/quota-check', { usedPct: maxUsed });
+      if (res && res.switched) {
+        await refreshAuthBridgeState(true);
+        showSettingsToast(L(`额度达 ${maxUsed}%，已自动切换至 ${res.to}`, `Quota ${maxUsed}% — switched to ${res.to}`));
+      }
+    } finally {
+      authQuotaCheckInFlight = false;
+    }
+  }
+
+  function renderAuthSettingsSectionHtml() {
+    if (authBridgeOnline === false) {
+      return `
+        <div id="ag-cux-auth-section" style="display:flex;flex-direction:column;gap:8px">
+          <h3 class="m-0">${L('多账号切换与额度自动轮换', 'Account Switcher & Quota Auto-Rotation')}</h3>
+          <div class="ag-cux-settings-group">
+            <div class="ag-cux-settings-row">
+              <div style="min-width:0">
+                <div class="ag-cux-settings-title">${L('本地账号桥接服务未连接', 'Local auth bridge is offline')}</div>
+                <div class="ag-cux-settings-desc">${L(
+                  '请运行一次 node install.mjs install 刷新后台守护进程，或点击重试。',
+                  'Run `node install.mjs install` once to start the local daemon bridge, then click Retry.'
+                )}</div>
+              </div>
+              <button type="button" class="ag-claude-inline-btn" data-ag-auth-action="refresh">${L('重试', 'Retry')}</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+    if (!authBridgeState) {
+      return `
+        <div id="ag-cux-auth-section" style="display:flex;flex-direction:column;gap:8px">
+          <h3 class="m-0">${L('多账号切换与额度自动轮换', 'Account Switcher & Quota Auto-Rotation')}</h3>
+          <div class="ag-cux-settings-group">
+            <div class="ag-cux-settings-row">
+              <div class="ag-cux-settings-desc">${L('正在加载账号池与自动切换配置…', 'Loading account pool & auto-switch settings…')}</div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+    const profiles = Array.isArray(authBridgeState.profiles) ? authBridgeState.profiles : [];
+    const active = authBridgeState.activeAccount || '';
+    const as = authBridgeState.autoSwitch || { enabled: false, thresholdUsedPct: 90, autoRestart: true };
+    const thresholds = [80, 85, 90, 95, 100];
+
+    const listRows = profiles.length
+      ? profiles
+          .map((p) => {
+            const isActive = Boolean(p.active);
+            const badges = [];
+            if (isActive) badges.push(`<span class="ag-cux-auth-pill" data-kind="active">${L('当前使用', 'Active')}</span>`);
+            if (p.hasDesktopMeta) badges.push(`<span class="ag-cux-auth-pill">Desktop</span>`);
+            if (p.hasOAuthCreds) badges.push(`<span class="ag-cux-auth-pill">CLI</span>`);
+            const actions = isActive
+              ? `<button type="button" class="ag-claude-inline-btn" data-ag-auth-action="save"${authBridgeBusy ? ' disabled' : ''}>${L('更新快照', 'Update')}</button>`
+              : `<button type="button" class="ag-claude-inline-btn" data-primary="true" data-ag-auth-action="switch" data-ag-auth-target="${escapeHtml(p.name)}"${authBridgeBusy ? ' disabled' : ''}>${L('切换', 'Switch')}</button>
+                 <button type="button" class="ag-claude-inline-btn" data-ag-auth-action="remove" data-ag-auth-target="${escapeHtml(p.name)}"${authBridgeBusy ? ' disabled' : ''}>${L('移除', 'Remove')}</button>`;
+            return `
+              <div class="ag-cux-settings-row">
+                <div style="min-width:0">
+                  <div class="ag-cux-settings-title ag-cux-auth-row-title">
+                    <span class="truncate">${escapeHtml(p.name)}</span>
+                    ${badges.join('')}
+                  </div>
+                </div>
+                <div class="ag-cux-auth-row-actions">${actions}</div>
+              </div>`;
+          })
+          .join('')
+      : `<div class="ag-cux-settings-row">
+          <div class="ag-cux-settings-desc">${L(
+            '号池暂无已保存账号。点击上方「保存当前账号」可将当前登录态存入号池。',
+            'No saved accounts yet. Click "Save Current" above to snapshot your active account.'
+          )}</div>
+        </div>`;
+
+    return `
+      <div id="ag-cux-auth-section" style="display:flex;flex-direction:column;gap:8px">
+        <div class="ag-cux-auth-hdr">
+          <h3 class="m-0">${L('多账号切换与额度自动轮换', 'Account Switcher & Quota Auto-Rotation')}</h3>
+          <div class="ag-cux-auth-row-actions">
+            <button type="button" class="ag-claude-inline-btn" data-ag-auth-action="save"${authBridgeBusy ? ' disabled' : ''}>${L('保存当前账号', 'Save Current')}</button>
+            <button type="button" class="ag-claude-inline-btn" data-primary="true" data-ag-auth-action="add"${authBridgeBusy ? ' disabled' : ''}>${L('添加新账号', 'Add Account')}</button>
+          </div>
+        </div>
+        <div class="ag-cux-settings-group">
+          <div class="ag-cux-settings-row">
+            <div style="min-width:0">
+              <div class="ag-cux-settings-title">${L('当前活跃账号', 'Active Account')}: ${escapeHtml(active || L('未登录', 'Not signed in'))}</div>
+              <div class="ag-cux-settings-desc">${L(
+                '同步管理 Electron 桌面端与 agy CLI 凭据；点击「添加新账号」会自动先备份当前账号，再清除会话并重启进入官方 Google 登录页。',
+                'Syncs both Electron Desktop and agy CLI credentials. "Add Account" backs up your current account first, then restarts into official Google Sign-In.'
+              )}</div>
+            </div>
+            <button type="button" class="ag-claude-inline-btn" data-ag-auth-action="refresh"${authBridgeBusy ? ' disabled' : ''}>${L('刷新', 'Refresh')}</button>
+          </div>
+          ${listRows}
+        </div>
+        <div class="ag-cux-settings-group">
+          <div class="ag-cux-settings-row">
+            <div style="min-width:0">
+              <div class="ag-cux-settings-title">${L('额度达阈值自动切换账号', 'Auto-Switch on Quota Threshold')}</div>
+              <div class="ag-cux-settings-desc">${L(
+                '当实时套餐已用额度达到设定百分比且号池 ≥ 2 个账号时，自动轮换至下一个账号',
+                'Automatically rotates to the next saved account when live plan usage reaches the threshold (requires ≥ 2 accounts)'
+              )}</div>
+            </div>
+            <button type="button" class="ag-claude-switch" role="switch" data-ag-auth-toggle="enabled" aria-checked="${Boolean(as.enabled)}"><span></span></button>
+          </div>
+          <div class="ag-cux-settings-row">
+            <div style="min-width:0">
+              <div class="ag-cux-settings-title">${L('触发切换的已用额度阈值', 'Usage Threshold (%)')}</div>
+              <div class="ag-cux-settings-desc">${L('默认 90%（剩余 10% 时提前轮换）', 'Default 90% (rotates with 10% headroom remaining)')}</div>
+            </div>
+            <select class="ag-cux-auth-select" data-ag-auth-select="thresholdUsedPct">
+              ${thresholds
+                .map((v) => `<option value="${v}"${Number(as.thresholdUsedPct || 90) === v ? ' selected' : ''}>${v}%</option>`)
+                .join('')}
+            </select>
+          </div>
+          <div class="ag-cux-settings-row">
+            <div style="min-width:0">
+              <div class="ag-cux-settings-title">${L('自动切换后立即重启桌面端', 'Auto-Restart Desktop After Switch')}</div>
+              <div class="ag-cux-settings-desc">${L(
+                '开启后自动重启 Antigravity 桌面端并保留 CDP 注入，使新账号立即生效',
+                'Gracefully relaunches Antigravity Desktop with CDP enabled so the new account takes effect immediately'
+              )}</div>
+            </div>
+            <button type="button" class="ag-claude-switch" role="switch" data-ag-auth-toggle="autoRestart" aria-checked="${Boolean(as.autoRestart !== false)}"><span></span></button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function bindAuthSettingsEvents(container) {
+    if (!container) return;
+    container.querySelectorAll('[data-ag-auth-action]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (authBridgeBusy) return;
+        const action = btn.getAttribute('data-ag-auth-action');
+        const target = btn.getAttribute('data-ag-auth-target') || '';
+        if (action === 'refresh') {
+          await refreshAuthBridgeState(true);
+          showSettingsToast(L('✓ 账号状态已刷新', '✓ Account status refreshed'));
+          return;
+        }
+        authBridgeBusy = true;
+        renderAuthSettingsSlot();
+        let res;
+        if (action === 'save') {
+          res = await authBridgeRequest('POST', '/auth/save', {});
+          if (res && res.ok) showSettingsToast(L(`✓ 已保存账号 ${res.account}`, `✓ Saved ${res.account}`));
+        } else if (action === 'add') {
+          res = await authBridgeRequest('POST', '/auth/add-account', { restartDesktop: true });
+          if (res && res.ok) {
+            showSettingsToast(L('✓ 已备份当前账号，正在重启进入新账号登录…', '✓ Current account backed up — restarting for sign-in…'));
+          }
+        } else if (action === 'switch') {
+          res = await authBridgeRequest('POST', '/auth/switch', { target, scope: 'both', restartDesktop: true });
+          if (res && res.ok) showSettingsToast(L(`✓ 已切换至 ${res.to}，正在生效…`, `✓ Switched to ${res.to}`));
+        } else if (action === 'remove') {
+          res = await authBridgeRequest('POST', '/auth/remove', { target });
+          if (res && res.ok) showSettingsToast(L(`✓ 已移除 ${res.account}`, `✓ Removed ${res.account}`));
+        }
+        authBridgeBusy = false;
+        if (res && res.status) {
+          authBridgeState = Object.assign({}, authBridgeState || {}, res.status);
+        } else {
+          await refreshAuthBridgeState(true);
+        }
+        renderAuthSettingsSlot();
+        if (quotaPopoverOpen) renderQuotaPopoverBody();
+      });
+    });
+
+    container.querySelectorAll('[data-ag-auth-toggle]').forEach((sw) => {
+      sw.addEventListener('click', async () => {
+        const key = sw.getAttribute('data-ag-auth-toggle');
+        const cur = Boolean(authBridgeState?.autoSwitch?.[key]);
+        const res = await authBridgeRequest('POST', '/auth/config', { autoSwitch: { [key]: !cur } });
+        if (res && res.ok && authBridgeState) {
+          authBridgeState.autoSwitch = res.autoSwitch;
+          renderAuthSettingsSlot();
+          if (quotaPopoverOpen) renderQuotaPopoverBody();
+          showSettingsToast(L('✓ 自动切换配置已保存', '✓ Auto-switch config saved'));
+        }
+      });
+    });
+
+    container.querySelectorAll('[data-ag-auth-select]').forEach((sel) => {
+      sel.addEventListener('change', async () => {
+        const key = sel.getAttribute('data-ag-auth-select');
+        const val = Number(sel.value);
+        const res = await authBridgeRequest('POST', '/auth/config', { autoSwitch: { [key]: val } });
+        if (res && res.ok && authBridgeState) {
+          authBridgeState.autoSwitch = res.autoSwitch;
+          if (quotaPopoverOpen) renderQuotaPopoverBody();
+          showSettingsToast(L(`✓ 阈值已设为 ${val}%`, `✓ Threshold set to ${val}%`));
+        }
+      });
+    });
+  }
+
+  function renderAuthSettingsSlot() {
+    if (!settingsPanelEl) return;
+    const slot = settingsPanelEl.querySelector('[data-ag-cux-auth-slot]');
+    if (!slot) return;
+    slot.innerHTML = renderAuthSettingsSectionHtml();
+    bindAuthSettingsEvents(slot);
+  }
+
   function renderSettingsPanelContent(panel) {
     if (!panel) return;
     panel.setAttribute('aria-label', L('界面增强设置', 'UI Enhancements Settings'));
@@ -4642,6 +5033,7 @@
             </div>
           </div>`
         ).join('')}
+        <div data-ag-cux-auth-slot>${renderAuthSettingsSectionHtml()}</div>
       </div>
     `;
     panel.querySelectorAll('[data-ag-cux-switch]').forEach((sw) => {
@@ -4651,6 +5043,8 @@
         setModuleOverride(modKey, featKey, !FEAT[featKey]);
       });
     });
+    bindAuthSettingsEvents(panel.querySelector('[data-ag-cux-auth-slot]'));
+    refreshAuthBridgeState(false);
   }
 
   function applyImmediateFeatureEffects(featKey, on) {
